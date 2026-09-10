@@ -1,0 +1,7 @@
+names:
+- residential_room
+- common_corridor
+nc: 2
+path: C:\Users\mayank\3d-cadastre\data\floor_plans
+train: images/train
+val: images/val

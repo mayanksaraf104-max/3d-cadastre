@@ -1,25 +1,40 @@
 import psycopg2
+import psycopg2.errors
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+import config
+from db_engine import CadastreDatabaseEngine
 
 print("Connecting to PostgreSQL...")
 
+# FIX: previously hardcoded user="postgres", password="mayank9431",
+# host="localhost" -- a real deployment's Postgres superuser/admin
+# credentials for provisioning the database are almost never the same
+# as its app-level credentials, and definitely aren't a fixed hackathon
+# password. This now requires PG_USER/PG_PASSWORD/PG_HOST/PG_DBNAME to
+# be set explicitly (config.py fails fast if they're missing) -- point
+# them at whatever role/host is allowed to CREATE DATABASE in your
+# environment (often a separate admin account from the app's runtime
+# PG_USER, in which case run this script once with the admin creds set).
+_admin_kwargs = dict(config.PG_DSN_KWARGS)
+target_dbname = _admin_kwargs.pop("dbname")
+
 # 1. Connect to the default server to create our specific cadastre database
-conn = psycopg2.connect(user="postgres", password="mayank9431", host="localhost")
+conn = psycopg2.connect(**_admin_kwargs)
 conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
 cursor = conn.cursor()
 
 try:
-    cursor.execute("CREATE DATABASE cadastre_db;")
-    print("✅ Database 'cadastre_db' created successfully.")
-except Exception as e:
-    print("⚠️ Database 'cadastre_db' already exists.")
+    cursor.execute(f"CREATE DATABASE {psycopg2.extensions.quote_ident(target_dbname, conn)};")
+    print(f"✅ Database '{target_dbname}' created successfully.")
+except psycopg2.errors.DuplicateDatabase:
+    print(f"ℹ️ Database '{target_dbname}' already exists -- continuing.")
 
 cursor.close()
 conn.close()
 
-# 2. Reconnect directly to the new 'cadastre_db' to install the OGC features
+# 2. Reconnect directly to the new database to install the OGC features
 print("Installing OGC Spatial Extensions...")
-conn = psycopg2.connect(dbname="cadastre_db", user="postgres", password="mayank9431", host="localhost")
+conn = psycopg2.connect(**config.PG_DSN_KWARGS)
 cursor = conn.cursor()
 
 # Enable the core PostGIS extension
@@ -28,62 +43,20 @@ cursor.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
 # Enable the 3D volume and advanced curve math extension
 cursor.execute("CREATE EXTENSION IF NOT EXISTS postgis_sfcgal;")
 
-# 3. Create the official registry ledger (Master Legal Record)
-print("Creating the Master 3D Property Registry table...")
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS property_registry (
-        ulpin VARCHAR(64) PRIMARY KEY,
-        unit_id VARCHAR(50) NOT NULL,
-        boundary geometry(GeometryZ, 4326) NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-""")
-
-# 4. Create the Spatial Shard table for R-Tree micro-binning
-print("Creating the Spatial Shards table for optimization...")
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS property_spatial_shards (
-        id SERIAL PRIMARY KEY,
-        ulpin VARCHAR(64) REFERENCES property_registry(ulpin) ON DELETE CASCADE,
-        shard_geom geometry(GeometryZ, 4326) NOT NULL
-    );
-""")
-
-# 5. Create the 3D bounding-box index ON THE SHARDS for lightning-fast clash detection
-print("Building the N-Dimensional GiST Index on the spatial shards...")
-cursor.execute("""
-    CREATE INDEX IF NOT EXISTS idx_shards_3d 
-    ON property_spatial_shards USING GIST (shard_geom gist_geometry_ops_nd);
-""")
-
-# 6. LADM tables (parties, deeds, ownership) — created here once,
-#    not on every upload inside CadastreDatabaseEngine.__init__.
-print("Creating LADM legal tables...")
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS parties (
-        party_id SERIAL PRIMARY KEY,
-        full_name VARCHAR(255) NOT NULL,
-        national_id VARCHAR(50) UNIQUE NOT NULL,
-        party_type VARCHAR(50)
-    );
-    CREATE TABLE IF NOT EXISTS legal_deeds (
-        deed_id SERIAL PRIMARY KEY,
-        deed_number VARCHAR(100) UNIQUE NOT NULL,
-        issue_date DATE NOT NULL,
-        encumbrance_status VARCHAR(100) DEFAULT 'CLEAR'
-    );
-    CREATE TABLE IF NOT EXISTS ownership_rights (
-        right_id SERIAL PRIMARY KEY,
-        ulpin VARCHAR(64) REFERENCES property_registry(ulpin) ON DELETE CASCADE,
-        party_id INT REFERENCES parties(party_id) ON DELETE CASCADE,
-        deed_id INT REFERENCES legal_deeds(deed_id) ON DELETE CASCADE,
-        right_type VARCHAR(50),
-        fractional_share DECIMAL(5,4) DEFAULT 1.0000
-    );
-""")
-
 conn.commit()
-print("✅ True 3D Cadastre Database fully initialized and ready!")
-
 cursor.close()
 conn.close()
+
+# 3. Create the schema through the SINGLE authoritative definition,
+#    CadastreDatabaseEngine.setup_ladm_schema() in db_engine.py (registry,
+#    spatial shards, indexes, LADM tables). No table/index/SRID/geometry
+#    definitions live in this script. Constructing the engine performs no
+#    DDL; the strict runtime statement_timeout it sets is lifted for this
+#    one-off session so index builds/migrations can finish.
+print("Creating the 3D cadastre schema (db_engine.setup_ladm_schema)...")
+with CadastreDatabaseEngine(use_pool=False) as db:
+    db.cursor.execute("SET statement_timeout = 0;")
+    db.conn.commit()
+    db.setup_ladm_schema()
+
+print("✅ True 3D Cadastre Database fully initialized and ready!")

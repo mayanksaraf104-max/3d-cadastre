@@ -2,29 +2,29 @@ import os
 import glob
 from ultralytics import YOLO
 
-# OpenCASCADE Imports
-from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakePolygon, BRepBuilderAPI_MakeFace
-from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakePrism
-from OCC.Core.gp import gp_Pnt, gp_Vec
+# OpenCASCADE Imports (inspection only: nothing in this module constructs geometry)
+from OCC.Core.BRepCheck import BRepCheck_Analyzer
 from OCC.Core.TopExp import TopExp_Explorer
-from OCC.Core.TopAbs import TopAbs_COMPOUND, TopAbs_SOLID, TopAbs_SHELL, TopAbs_FACE, TopAbs_WIRE, TopAbs_EDGE, TopAbs_VERTEX
-from OCC.Core.BRepTools import BRepTools_WireExplorer
+from OCC.Core.TopAbs import TopAbs_COMPOUND, TopAbs_SOLID, TopAbs_SHELL, TopAbs_FACE, TopAbs_WIRE, TopAbs_EDGE
+from OCC.Core.BRepTools import BRepTools_WireExplorer, breptools
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.TopoDS import topods, TopoDS_Iterator
-from OCC.Core.GeomAbs import GeomAbs_Line, GeomAbs_Circle
-from OCC.Core.BRepAdaptor import BRepAdaptor_Curve
+from OCC.Core.GeomAbs import GeomAbs_Line, GeomAbs_Plane
+from OCC.Core.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
 
 # Local Project Imports
-from cad_engine import build_ogc_multisolid, resolve_internal_overlaps
 from db_engine import CadastreDatabaseEngine
+import config
 
 # ==========================================
-# 1. AI TO CAD EXTRUSION & OPTIMIZED EXTRACTOR
+# 1. MEASURED 3D INPUT (YOLO = 2D REFERENCE ONLY) & LOSSLESS EXTRACTOR
 # ==========================================
-def extract_vertices_from_wire(wire, face=None, tolerance=0.02):
+def extract_vertices_from_wire(wire, face=None):
     """
-    Extracts ordered coordinates and strips redundant collinear vertices,
-    with a strict safety floor to ensure polygons never drop below 4 points.
+    Extracts the ordered, closed vertex ring of a wire, losslessly: every
+    3D vertex is kept (no XY-based or any other decimation) and coordinates
+    are written at full float precision (repr round-trips), never rounded.
+    A wire with fewer than 3 vertices is rejected, not dropped or patched.
 
     FIX: pass the parent `face` through to BRepTools_WireExplorer. Without
     it, the explorer walks the wire's own raw edge order and ignores the
@@ -41,85 +41,56 @@ def extract_vertices_from_wire(wire, face=None, tolerance=0.02):
     else:
         ordered_vertices = BRepTools_WireExplorer(wire)
 
-    raw_coords = []
-
+    coords = []
     while ordered_vertices.More():
-        vertex = ordered_vertices.CurrentVertex()
-        pnt = BRep_Tool.Pnt(vertex)
-        raw_coords.append((pnt.X(), pnt.Y(), pnt.Z()))
+        pnt = BRep_Tool.Pnt(ordered_vertices.CurrentVertex())
+        coords.append(f"{pnt.X()!r} {pnt.Y()!r} {pnt.Z()!r}")
         ordered_vertices.Next()
 
-    if not raw_coords:
-        return []
-
-    # Collinear Decimation filter
-    optimized_coords = [raw_coords[0]]
-    for i in range(1, len(raw_coords) - 1):
-        prev = optimized_coords[-1]
-        curr = raw_coords[i]
-        nxt = raw_coords[i + 1]
-
-        dx1, dy1 = curr[0] - prev[0], curr[1] - prev[1]
-        dx2, dy2 = nxt[0] - curr[0], nxt[1] - curr[1]
-
-        cross_product = abs(dx1 * dy2 - dy1 * dx2)
-        if cross_product > tolerance:
-            optimized_coords.append(curr)
-
-    optimized_coords.append(raw_coords[-1])
-
-    # SAFETY FLOOR: If decimation left us with fewer than 4 points, revert to raw coords to avoid PostGIS rejection
-    if len(optimized_coords) < 4:
-        optimized_coords = raw_coords
-
-    formatted_coords = [f"{pt[0]:.4f} {pt[1]:.4f} {pt[2]:.4f}" for pt in optimized_coords]
-    if formatted_coords and formatted_coords[0] != formatted_coords[-1]:
-        formatted_coords.append(formatted_coords[0])
-
-    return formatted_coords
+    if len(coords) < 3:
+        raise ValueError(f"Degenerate wire: {len(coords)} vertices (need >= 3).")
+    if coords[0] != coords[-1]:
+        coords.append(coords[0])
+    return coords
 
 
-def extrude_yolo_to_occ(poly_pts, z_base=0.0, height=3.0, scale_factor=0.05, offset_x=0.0, offset_y=0.0):
-    """Converts raw 2D YOLO pixels into a 3D OpenCASCADE solid anchored to world coordinates."""
-    polygon_builder = BRepBuilderAPI_MakePolygon()
-    for pt in poly_pts:
-        world_x = float(pt[0] * scale_factor) + offset_x
-        world_y = float(pt[1] * scale_factor) + offset_y
-        polygon_builder.Add(gp_Pnt(world_x, world_y, z_base))
-    polygon_builder.Close()
+def process_and_group_blueprint(image_path, measured_rooms, weights_path=config.YOLO_INFERENCE_MODEL_PATH):
+    """
+    `measured_rooms`: iterable of independently measured / validated 3D OCC
+    B-Rep solids (the ONLY source of room geometry). If none is supplied, or
+    any is missing / not a valid solid, this raises; nothing is generated.
 
-    face = BRepBuilderAPI_MakeFace(polygon_builder.Wire()).Face()
-    return BRepPrimAPI_MakePrism(face, gp_Vec(0, 0, height)).Shape()
+    YOLO masks are 2D semantic/reference correspondence only: they are
+    returned as `reference_masks` and are never converted into geometry (no
+    scale, offset, base Z, height or extrusion). Measured solids are returned
+    exactly as supplied: not grouped, fused, trimmed, sliced or repaired.
+    db_engine registers ONE POLYHEDRALSURFACE Z per property, so each solid
+    is serialized and registered on its own (see main).
 
+    Returns (measured_solids, reference_masks).
+    """
+    rooms = list(measured_rooms or [])
+    if not rooms:
+        raise ValueError(
+            "No measured 3D geometry supplied. Blueprint/YOLO polygons are not "
+            "geometry and are never extruded.")
+    for i, room in enumerate(rooms):
+        if room is None or room.IsNull() or room.ShapeType() != TopAbs_SOLID:
+            raise ValueError(f"measured room {i}: missing or not a B-Rep solid.")
+        if not BRepCheck_Analyzer(room).IsValid():
+            raise ValueError(f"measured room {i}: invalid B-Rep solid.")
 
-def process_and_group_blueprint(image_path, weights_path="runs/segment/runs/sih_model_v2/weights/best.pt"):
-    print(f"🏗️ Processing Blueprint: {image_path}")
+    print(f"🏗️ Processing Blueprint (2D reference): {image_path}")
     model = YOLO(weights_path)
     results = model(image_path)
+    reference_masks = [poly for r in results if r.masks is not None for poly in r.masks.xy]
+    print(f"🗂️ {len(reference_masks)} YOLO masks kept as 2D reference only (not geometry).")
 
-    individual_rooms = []
-    for r in results:
-        if r.masks is None:
-            continue
-        for i, poly_pts in enumerate(r.masks.xy):
-            if len(poly_pts) >= 3:
-                try:
-                    solid = extrude_yolo_to_occ(poly_pts, offset_x=30000.0, offset_y=10000.0)
-                    individual_rooms.append(solid)
-                except Exception as e:
-                    print(f"⚠️ Failed to build solid: {e}")
-
-    print(f"✅ Extruded {len(individual_rooms)} individual rooms.")
-
-    # Run the Boolean Auto-Resolver to slice away fuzzy AI overlap
-    clean_rooms = resolve_internal_overlaps(individual_rooms)
-
-    print("🔗 Grouping perfectly flushed rooms into a single OGC MultiSolid...")
-    return build_ogc_multisolid(clean_rooms)
+    return rooms, reference_masks
 
 
 # ==========================================
-# 2. UNIVERSAL OGC ROUTER
+# 2. OGC ROUTER (POLYHEDRALSURFACE Z ONLY)
 # ==========================================
 def is_wire_curved(wire):
     edge_explorer = TopExp_Explorer(wire, TopAbs_EDGE)
@@ -132,96 +103,140 @@ def is_wire_curved(wire):
 
 
 def occ_to_wkt(shape):
-    """TRUE 15-CLASS OGC ROUTER (Clean Collection Handler)"""
+    """
+    Lossless OCC B-Rep -> WKT for the POLYHEDRALSURFACE Z contract only.
+
+    Every face is emitted as one polygon with its outer wire first, then its
+    inner wires (holes), at full coordinate precision. Anything that cannot
+    be written exactly is REJECTED (ValueError), never approximated, elided
+    ("...") or fabricated: curved edges, non-planar faces, solids with more
+    than one shell, degenerate wires, a compound of more than one shape, and
+    any shape that is not a solid or shell (bare faces, wires, edges,
+    vertices). Output is always a single POLYHEDRALSURFACE Z, never a
+    GEOMETRYCOLLECTION.
+    """
+    if shape is None or shape.IsNull():
+        raise ValueError("Missing geometry: nothing to convert.")
     shape_type = shape.ShapeType()
 
     if shape_type == TopAbs_COMPOUND:
+        # A compound is only a container. Exactly one child is serialized as
+        # itself; several independent solids are REJECTED (never emitted as a
+        # GEOMETRYCOLLECTION, merged, unioned or otherwise combined): register
+        # each solid on its own.
         iterator = TopoDS_Iterator(shape)
-        child_wkts = []
-
+        children = []
         while iterator.More():
-            child_shape = iterator.Value()
-            child_wkt = occ_to_wkt(child_shape)
-            if child_wkt:
-                child_wkts.append(child_wkt)
+            children.append(iterator.Value())
             iterator.Next()
 
-        # Wrap all individual shapes cleanly into an OGC GeometryCollection
-        return f"GEOMETRYCOLLECTION Z ({', '.join(child_wkts)})"
+        if len(children) != 1:
+            raise ValueError(
+                f"Compound holds {len(children)} shapes; the POLYHEDRALSURFACE Z "
+                f"contract takes exactly one solid per registration. Register "
+                f"each measured solid separately.")
+        return occ_to_wkt(children[0])
 
-    elif shape_type in (TopAbs_SOLID, TopAbs_SHELL):
+    if shape_type in (TopAbs_SOLID, TopAbs_SHELL):
+        if shape_type == TopAbs_SOLID:
+            shell_count, shells = 0, TopExp_Explorer(shape, TopAbs_SHELL)
+            while shells.More():
+                shell_count += 1
+                shells.Next()
+            if shell_count != 1:
+                raise ValueError(
+                    f"Solid has {shell_count} shells; only a single-shell "
+                    f"POLYHEDRALSURFACE Z is supported.")
+
         face_explorer = TopExp_Explorer(shape, TopAbs_FACE)
-        wkt_polygons, is_tin = [], True
+        wkt_faces = []
         while face_explorer.More():
             face = topods.Face(face_explorer.Current())
+            if BRepAdaptor_Surface(face).GetType() != GeomAbs_Plane:
+                raise ValueError("Non-planar face: not representable exactly as a polygon.")
+
+            outer = breptools.OuterWire(face)
+            wires = [outer]
             wire_explorer = TopExp_Explorer(face, TopAbs_WIRE)
             while wire_explorer.More():
-                # FIX: pass `face` so wire traversal respects its Orientation() flag
-                coords = extract_vertices_from_wire(topods.Wire(wire_explorer.Current()), face)
-                if coords:
-                    wkt_polygons.append(f"(({', '.join(coords)}))")
-                    if len(coords) > 4:
-                        is_tin = False
+                wire = topods.Wire(wire_explorer.Current())
+                if not wire.IsSame(outer):
+                    wires.append(wire)
                 wire_explorer.Next()
+
+            rings = []
+            for wire in wires:
+                if is_wire_curved(wire):
+                    raise ValueError("Curved edge: not representable exactly in POLYHEDRALSURFACE Z.")
+                # pass `face` so wire traversal respects its Orientation() flag
+                rings.append(f"({', '.join(extract_vertices_from_wire(wire, face))})")
+            wkt_faces.append(f"({', '.join(rings)})")
             face_explorer.Next()
-        if is_tin and wkt_polygons:
-            return f"TIN Z ({', '.join(wkt_polygons)})"
-        return f"POLYHEDRALSURFACE Z ({', '.join(wkt_polygons)})"
 
-    elif shape_type == TopAbs_FACE:
-        face = topods.Face(shape)
-        wire_explorer, rings, is_curved = TopExp_Explorer(face, TopAbs_WIRE), [], False
-        while wire_explorer.More():
-            wire = topods.Wire(wire_explorer.Current())
-            if is_wire_curved(wire):
-                is_curved = True
-            # FIX: pass `face` here too, for the same reason as above
-            coords = extract_vertices_from_wire(wire, face)
-            if coords:
-                rings.append(f"({', '.join(coords)})")
-            wire_explorer.Next()
-        if is_curved:
-            return f"CURVEPOLYGON Z ({', '.join(rings)})"
-        if len(rings) == 1 and rings[0].count(',') == 3:
-            return f"TRIANGLE Z {rings[0]}"
-        return f"POLYGON Z ({', '.join(rings)})"
+        if not wkt_faces:
+            raise ValueError("Solid/shell has no faces.")
+        return f"POLYHEDRALSURFACE Z ({', '.join(wkt_faces)})"
 
-    elif shape_type == TopAbs_WIRE:
-        if is_wire_curved(topods.Wire(shape)):
-            return f"COMPOUNDCURVE Z (...)"
-        return f"LINESTRING Z (...)"
-
-    elif shape_type == TopAbs_EDGE:
-        edge = topods.Edge(shape)
-        v1 = topods.Vertex(TopExp_Explorer(edge, TopAbs_VERTEX).Current())
-        pnt1 = BRep_Tool.Pnt(v1)
-        if BRepAdaptor_Curve(edge).GetType() == GeomAbs_Circle:
-            return f"CIRCULARSTRING Z ({pnt1.X():.4f} {pnt1.Y():.4f} {pnt1.Z():.4f}, ...)"
-        return f"LINESTRING Z ({pnt1.X():.4f} {pnt1.Y():.4f} {pnt1.Z():.4f}, ...)"
-
-    elif shape_type == TopAbs_VERTEX:
-        pnt = BRep_Tool.Pnt(topods.Vertex(shape))
-        return f"POINT Z ({pnt.X():.4f} {pnt.Y():.4f} {pnt.Z():.4f})"
-
-    return None
+    raise ValueError(
+        f"Unsupported shape type {shape_type} for the POLYHEDRALSURFACE Z contract.")
 
 
 # ==========================================
 # 3. MAIN EXECUTION
 # ==========================================
+# Usage: python generate_3d.py MEASURED.step [MORE.step ...]
+# Room geometry comes ONLY from the supplied measured 3D STEP solids, which
+# must already be in the cadastre CRS (nothing is reprojected or moved here).
+# Requires CADASTRE_STATE_CODE and CADASTRE_DISTRICT_CODE (recorded in each
+# ULPIN by db_engine.register_property). Each solid is registered separately.
 if __name__ == "__main__":
+    import sys
+    from OCC.Core.STEPControl import STEPControl_Reader
+    from OCC.Core.IFSelect import IFSelect_RetDone
+
+    def load_measured_solids(path):
+        reader = STEPControl_Reader()
+        if reader.ReadFile(path) != IFSelect_RetDone:
+            raise SystemExit(f"Cannot read STEP file: {path}")
+        reader.TransferRoots()
+        explorer = TopExp_Explorer(reader.OneShape(), TopAbs_SOLID)
+        solids = []
+        while explorer.More():
+            solids.append(topods.Solid(explorer.Current()))
+            explorer.Next()
+        return solids
+
     image_paths = glob.glob("data/floor_plans/images/val/*")
-    if image_paths:
+    step_paths = sys.argv[1:]
+    missing = [k for k in ("CADASTRE_STATE_CODE", "CADASTRE_DISTRICT_CODE") if not os.environ.get(k)]
+    if not image_paths:
+        print("❌ No validation images found.")
+    elif not step_paths:
+        print("❌ No measured 3D geometry supplied. Usage: python generate_3d.py MEASURED.step [...]")
+    elif missing:
+        print(f"❌ Set {', '.join(missing)}: they are recorded in each ULPIN and have no default.")
+    else:
         print("\n--- 🚀 STARTING FULL PIPELINE ---")
 
-        final_property = process_and_group_blueprint(image_paths[0])
-        wkt_string = occ_to_wkt(final_property)
+        measured = [s for p in step_paths for s in load_measured_solids(p)]
+        rooms, _reference_masks = process_and_group_blueprint(image_paths[0], measured)
+        # Serialize every solid first: one unsupported solid rejects the batch
+        # before anything is registered.
+        wkt_strings = [occ_to_wkt(room) for room in rooms]
 
+        # Increment the version ID to prevent spatial overlap collision with previous inserts
+        base_id = "UNIT_AI_GEN_v6"
         try:
-            db = CadastreDatabaseEngine()
-            # Increment the version ID to prevent spatial overlap collision with previous inserts
-            db.register_property("UNIT_AI_GEN_v6", wkt_string)
+            with CadastreDatabaseEngine(use_pool=False) as db:
+                for n, wkt_string in enumerate(wkt_strings, start=1):
+                    unit_id = base_id if len(wkt_strings) == 1 else f"{base_id}_P{n}"
+                    ulpin = db.register_property(
+                        unit_id=unit_id,
+                        ogc_3d_wkt=wkt_string,
+                        state_code=os.environ["CADASTRE_STATE_CODE"],
+                        district_code=os.environ["CADASTRE_DISTRICT_CODE"],
+                    )
+                    if ulpin is None:
+                        print(f"❌ {unit_id} was not registered (rejected -- see the log above).")
         except Exception as e:
-            print(f"❌ Database Connection Failed: {e}")
-    else:
-        print("❌ No validation images found.")
+            print(f"❌ Database error: {e}")

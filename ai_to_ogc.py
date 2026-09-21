@@ -3,25 +3,55 @@ import shapely.geometry as sg
 from shapely.validation import make_valid
 from ultralytics import YOLO
 
+import config
+
 def extract_ogc_boundaries(
     image_path,
-    weights_path="runs/segment/runs/sih_hybrid_model/weights/best.pt",
+    weights_path=config.YOLO_INFERENCE_MODEL_PATH,
     tolerance=1.5,
-    z_base=0.0,  # Feeds the 3D database; main.py now actually reads this
-    z_top=3.0,   # Feeds the 3D database; main.py now actually reads this
     max_aspect_ratio=10.0  # Rejects degenerate slivers (see NOTE below)
 ):
     """
     Loads the trained YOLOv8 model, runs inference on a floor plan,
-    and extracts simplified OGC Polygons with Z-axis heights.
+    and extracts simplified OGC Polygons.
+
+    Z-AXIS FIX: this function used to hardcode z_base=0.0 / z_top=3.0 as
+    default parameters and stamp every single detected unit with those
+    exact same two numbers. That's fabricated elevation, not measured
+    data -- and it's why every floor came out perfectly flat regardless
+    of what LiDAR was indexed: this function was never given real Z
+    information to begin with, so it just made two numbers up.
+
+    This function only ever sees the floor-plan IMAGE, so its polygons
+    are in PIXEL space -- they have no real-world elevation, and
+    (per get_intersecting_lidar_tiles' docstring in z_engine.py) can't be
+    used to query LiDAR directly; they first need the GNSS affine
+    transform into real-world / CADASTRE_SRID coordinates, which happens
+    downstream in main.py. So rather than fabricate z_base/z_top here,
+    each unit now carries `floor_points_xyz: None` and `z_top: None` as
+    explicit placeholders, to be filled in downstream.
+
+    Downstream, main.py transforms the polygon to global coordinates
+    (GNSS affine) and obtains authoritative measured XYZ surface evidence
+    from the current z_engine pipeline. The YOLO polygon is only 2D
+    reference/semantic evidence; it never supplies elevation, and nothing
+    here extrudes it or generates geometry.
+
+    `floor_points_xyz` is an (N, 3) array of real floor-surface points
+    (see z_engine.get_floor_points_xyz), not a scalar -- it preserves
+    slopes, dips, and split-levels instead of flattening the floor to one
+    number. Feed it directly into SectionProfile; don't reduce it to a
+    scalar (e.g. its own min/mean) before doing so, or you reintroduce
+    the exact flat-floor problem this fix removes. If a future blueprint
+    annotation format supplies floor elevation hints directly from the
+    2D drawing (e.g. contour/spot-height labels), those should also be
+    threaded through as points here rather than collapsed to a constant.
 
     NOTE: `clean_poly` can legitimately be a Polygon WITH interior rings
     (holes) -- e.g. a courtyard, atrium, or light well inside a footprint.
     make_valid() and the MultiPolygon-selection branch below both preserve
-    `clean_poly.interiors` correctly; nothing here drops them. Previously
-    main.py's extrusion step only ever read `poly.exterior`, silently
-    filling in any such holes. main.py has been updated to walk
-    `poly.interiors` too, so those holes now come through as real voids
+    `clean_poly.interiors` correctly; nothing here drops them. main.py
+    walks `poly.interiors` too, so those holes come through as real voids
     in the extruded solid instead of being lost.
 
     NOTE on `max_aspect_ratio`: the YOLO mask -> simplify -> make_valid
@@ -102,13 +132,19 @@ def extract_ogc_boundaries(
                 # 3. Classify into legal cadastral unit types
                 cadastre_type = "COMM_CORRIDOR" if "corridor" in class_name.lower() else "RES_ROOM"
 
-                # 4. Formatted perfectly for overlap_engine.py / main.py
+                # 4. Formatted for overlap_engine.py / main.py.
+                # floor_points_xyz / z_top are intentionally None here --
+                # this function only has pixel-space geometry, no real
+                # elevation. main.py obtains authoritative measured XYZ
+                # surface evidence from the current z_engine pipeline.
+                # See the module docstring above for why a fabricated
+                # uniform value here was the actual bug.
                 ogc_units.append({
                     "id": f"AI_Unit_{seg_idx+1}",       # Matches overlap_engine
                     "type": cadastre_type,
                     "polygon": clean_poly,              # The cleaned Shapely object (holes preserved)
-                    "z_base": float(z_base),            # Default ground level
-                    "z_top": float(z_top),              # Default ceiling level
+                    "floor_points_xyz": None,           # (N,3) real floor evidence -- filled downstream
+                    "z_top": None,                      # measured roof Z -- filled downstream
                     "raw_point_count": len(mask_coords),
                     "ogc_point_count": len(clean_poly.exterior.coords),
                     "hole_count": len(clean_poly.interiors),
@@ -127,11 +163,12 @@ if __name__ == "__main__":
     else:
         units = extract_ogc_boundaries(test_image)
 
-        print(f"\n✅ Extracted {len(units)} OGC-compliant 3D property units from the neural net:\n")
+        print(f"\n✅ Extracted {len(units)} OGC-compliant property units from the neural net:\n")
 
         for u in units:
             print(f"[{u['id']}] Type: {u['type']}")
             print(f"  Points: Reduced from {u['raw_point_count']} pixel vertices -> {u['ogc_point_count']} OGC vertices")
             print(f"  Holes: {u['hole_count']}")
-            print(f"  Z-Bounds: {u['z_base']}m to {u['z_top']}m")
+            print(f"  Floor evidence / Z-top: pending downstream LiDAR fusion "
+                  f"(floor_points_xyz={u['floor_points_xyz']}, z_top={u['z_top']})")
             print(f"  OGC 2D WKT: {u['wkt_ogc'][:60]}...\n")

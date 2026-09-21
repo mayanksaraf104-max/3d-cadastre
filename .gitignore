@@ -1,0 +1,104 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Generated 3D/output files
+*.glb
+*.gml
+*.obj
+*.zip
+*.png
+*.jpg
+*.jpeg
+
+# Tests not ready for publication
+tests/
+test_*.py
+
+# Diagnostics
+check_*.py
+diagnose_*.py
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# GIS data
+SOI_ABDB/
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+
+# ML models
+*.pt
+*.pth
+*.onnx
+runs/
+data/
+
+# Environments
+venv/
+venv_gpu/
+.venv/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Test / generated geometry
+*.obj
+*.jpg
+*.jpeg
+
+# Local experiments
+bench/
+modules/
+floor-plan-object-detection/
+
+# Local diagnostic files
+*_benchmark.py
+check_*.py
+diagnose_*.py
+force_truncate_db.py
+kill_db_locks.py
+generate_mock_lidar.py
+
+# Temporary model/testing images
+drone_sample.jpg
+WhatsApp Image *.jpeg
+# Test / generated geometry
+*.obj
+*.jpg
+*.jpeg
+
+# Local experiments
+bench/
+modules/
+floor-plan-object-detection/
+
+# Local diagnostic files
+*_benchmark.py
+check_*.py
+diagnose_*.py
+force_truncate_db.py
+kill_db_locks.py
+generate_mock_lidar.py
+
+# Temporary model/testing images
+drone_sample.jpg
+WhatsApp Image *.jpeg
+
+# Large/local datasets and artifacts
+SOI_ABDB/
+*.zip
+*.obj
+*.glb
+*.gml
+*.jpg
+*.jpeg
+*.png
+tests/

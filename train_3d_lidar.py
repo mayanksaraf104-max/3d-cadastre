@@ -3,8 +3,8 @@
 train_3d_lidar.py  –  SIH 26011 · 3D Cadastre Z-Axis Elevation Engine
 ══════════════════════════════════════════════════════════════════════
 Processes .las / .laz LiDAR point clouds to extract building heights,
-floor-slab elevations, and roof surfaces for conversion into OGC 3D
-geometries (POLYHEDRALSURFACE Z, TIN Z).
+floor-slab elevations (metadata only), and candidate exposed-surface point
+evidence (raw XYZ) for downstream OpenCASCADE surface / B-Rep reconstruction.
 
 Pipeline overview
 ─────────────────
@@ -13,19 +13,25 @@ Pipeline overview
   2.  FLOOR     – Build a 1-D vertical (Z-axis) point-density
                   histogram and run peak detection to locate the
                   physical Z-elevation of each concrete floor slab.
-  3.  ROOF      – Extract the topmost point-cloud slice and:
-                    a) Fit a plane via RANSAC  → Ax + By + Cz + D = 0
-                       (for standard pitched / flat roofs).
-                    b) If the RANSAC residual is too high (curved /
-                       organic roof), fall back to Delaunay
-                       triangulation → 2.5-D TIN surface.
-  4.  OUTPUT    – Return structured results with Z_min, Z_max, floor
-                  elevations, roof equation, and OGC-ready WKT
-                  fragments (POLYHEDRALSURFACE Z / TIN Z).
+  3.  SURFACE   – Select candidate exposed-surface evidence: building
+                  points on locally surface-like 3-D neighbourhoods
+                  (k-NN PCA in XYZ) with an open view on at least one
+                  side. Roofs are NOT distinguished from facades or
+                  other exterior surfaces. No Z slice and no XY
+                  projection; every measured point is kept in
+                  ``building_points_xyz``. A RANSAC plane is computed as a
+                  DIAGNOSTIC only.
+  4.  OUTPUT    – Return the raw measured XYZ of every point positively
+                  identified as building evidence by the LAS
+                  classification (``building_points_xyz``; sole
+                  authoritative geometry, and COMPLETE only when
+                  ``completeness.established`` is True) plus candidate
+                  surface-evidence subset (not a roof label) and Z_min /
+                  Z_max / floor elevations as metadata. No geometry is generated here.
 
 Requirements
 ────────────
-  pip install laspy[lazrs] numpy scikit-learn scipy shapely
+  pip install laspy[lazrs] numpy scipy
 
 Usage
 ─────
@@ -38,8 +44,8 @@ Usage
   # Process all .las/.laz files in a directory:
   python train_3d_lidar.py --dir data/raw_lidar/
 
-  # Generate OGC WKT output only (skip the plots):
-  python train_3d_lidar.py --las sample.las --no-plot
+  # Skip the plots and save the identified building XYZ (exact float64 .npy):
+  python train_3d_lidar.py --las sample.las --no-plot --points-out out/building.npy
 """
 
 from __future__ import annotations
@@ -51,14 +57,11 @@ import math
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import laspy
 import numpy as np
 from scipy.signal import find_peaks
-from scipy.spatial import Delaunay
-from shapely.geometry import Polygon as ShapelyPolygon
-from sklearn.linear_model import RANSACRegressor
+from scipy.spatial import cKDTree
 
 # ────────────────────────────────────────────────────────────────────
 # Logging
@@ -80,6 +83,35 @@ log = logging.getLogger("train_3d_lidar")
 # See: https://www.asprs.org/wp-content/uploads/2019/03/LAS_1_4_r15.pdf
 ASPRS_GROUND: int   = 2     # Class 2 = Ground
 ASPRS_BUILDING: int = 6     # Class 6 = Building
+ASPRS_UNCLASSIFIED: tuple[int, ...] = (0, 1)   # never classified / unclassified
+
+# LAS classes accepted as building evidence for the authoritative
+# ``building_points_xyz`` cloud. Default is the standard Building class;
+# add any vendor-specific building class codes used by the dataset here.
+# Ground (class 2) must never be listed.
+BUILDING_EVIDENCE_CLASSES: tuple[int, ...] = (ASPRS_BUILDING,)
+
+# Standard LAS classes that DEFINITIVELY mean "not building" (ground,
+# vegetation, noise, water, rail, road, wires/towers, bridge deck). Every
+# point must fall in ``building_classes`` or a non-building set for the
+# building cloud to be established as complete.
+# Deliberately NOT listed (building status is dataset-dependent, so they
+# stay UNRESOLVED unless the caller configures them explicitly): class 0/1
+# (never classified / unclassified), 8 (Model Key-point), 12 (Overlap
+# Points), other reserved codes (19+) and user-defined classes. Model
+# Key-point and Overlap Points are standard LAS classes, but their
+# building status is dataset-dependent, so they are NOT assumed
+# non-building.
+KNOWN_NON_BUILDING_CLASSES: tuple[int, ...] = (
+    2, 3, 4, 5, 7, 9, 10, 11, 13, 14, 15, 16, 17, 18,
+)
+
+# EARLY-INGESTION SAFETY CHECK ONLY: if more than this fraction of the
+# file is unclassified (class 0/1), ingestion fails outright because the
+# classification clearly cannot separate building from ground. Passing it
+# does NOT establish completeness; that is decided solely by the full
+# unresolved-class check (``CloudCompleteness``).
+MAX_UNCLASSIFIED_FRACTION: float = 0.5
 
 # ── Floor slab detection ─────────────────────────────────────────
 # Histogram bin width (metres).  0.20 m ≈ the thickness of a
@@ -95,19 +127,33 @@ PEAK_PROMINENCE_FRAC: float = 0.10
 # detected floor slabs.  A typical storey is ≥ 2.5 m.
 MIN_FLOOR_SPACING_M: float = 2.0
 
-# ── Roof extraction ──────────────────────────────────────────────
-# Thickness (metres) of the "roof slice" taken from the top of the
-# building point cloud.  Only points within [Z_max − slice, Z_max]
-# are used for plane fitting.
-ROOF_SLICE_THICKNESS_M: float = 1.0
+# ── Candidate surface evidence ────────────────────────────────────────
+# A measured point is candidate exposed-surface evidence (NOT a roof label) when its k-NN neighbourhood
+# (true 3-D) is surface-like AND at least one side of that local sheet has
+# a wide-open view (see below). No slope / Z-orientation rule is applied,
+# so steep, vertical, curved and folded surfaces are all eligible. This
+# only SELECTS measured points as evidence: none is moved, added, or
+# removed from the authoritative ``building_points_xyz`` cloud.
+SURFACE_EVIDENCE_KNN: int                = 12
+# 3-D exposure test: a side (+n or -n of the local surface normal) is
+# "open" when a thin tube marched along the normal AND along a small cone
+# of rays tilted around it meets no measured building point. A surface
+# with no open side (covered / enclosed: intermediate slab, balcony,
+# overhang, room ceiling) is ambiguous and left unlabelled. Tube radius
+# is derived
+# from the local point spacing (median k-th neighbour distance), the ray
+# runs to the building's 3-D bounding-box diagonal (no Z range used).
+SURFACE_TUBE_RADIUS_FACTOR: float = 1.0
+SURFACE_CONE_HALF_ANGLE_DEG: float = 45.0   # tilt of the extra cone rays
+SURFACE_CONE_RAYS: int = 6                  # rays around the normal per side
 
-# RANSAC parameters for plane fitting.
+# RANSAC parameters (DIAGNOSTIC plane fit only; never used as geometry).
 RANSAC_RESIDUAL_THRESHOLD_M: float = 0.15   # inlier distance (metres)
 RANSAC_MAX_TRIALS: int             = 1000
 
 # If the mean absolute RANSAC residual exceeds this value (metres),
-# the roof is deemed "curved / organic" and we fall back to a TIN.
-CURVED_ROOF_RESIDUAL_THRESHOLD_M: float = 0.30
+# the evidence set is flagged non-planar (diagnostic metadata only).
+CURVED_SURFACE_RESIDUAL_THRESHOLD_M: float = 0.30
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -128,16 +174,52 @@ class FloorSlabResult:
 
 
 @dataclass
-class RoofSurfaceResult:
-    """Result of the roof-surface extraction stage."""
-    # RANSAC plane: Ax + By + Cz + D = 0
+class SurfaceEvidenceResult:
+    """Candidate exposed-surface evidence (raw XYZ); NOT a roof label."""
+    # CANDIDATE evidence: unmodified measured points (a subset of the
+    # authoritative ``building_points_xyz``); no rounding, resampling,
+    # interpolation, or added points.
+    surface_evidence_xyz: np.ndarray   # (M, 3) subset of building_points_xyz
+    # DIAGNOSTIC / METADATA ONLY (Ax + By + Cz + D = 0 RANSAC fit); never
+    # used to generate geometry.
     plane_coefficients: tuple[float, float, float, float] | None  # (A,B,C,D)
     pitch_angle_deg: float | None      # angle between plane normal & vertical
-    is_curved: bool                    # True → TIN fallback was used
+    is_curved: bool | None             # residual above threshold (diagnostic)
     ransac_mean_residual: float | None # mean |residual| in metres
-    tin_vertices: np.ndarray | None    # (M, 3) array of TIN vertex coords
-    tin_simplices: np.ndarray | None   # (T, 3) Delaunay triangle indices
-    ogc_wkt: str                       # OGC WKT fragment
+    # Always False: without an external semantic roof label, exposed
+    # facades / exterior surfaces cannot be told from roofs (no gravity or
+    # Z reference is assumed). Nothing here is authoritative roof geometry;
+    # ``building_points_xyz`` is the sole authoritative measured cloud.
+    roof_label_authoritative: bool = False
+
+
+@dataclass
+class CloudCompleteness:
+    """Whether the input classification establishes building-cloud completeness."""
+    # True only if EVERY point in the file is positively assigned either to
+    # a building class or to a known non-building class. Nothing is guessed:
+    # unresolved points (class 0/1, reserved, unknown) are never treated as
+    # building or as non-building.
+    established: bool
+    unresolved_points: int
+    unresolved_classes: dict[int, int]   # class code -> point count
+    reason: str
+
+
+class IncompleteBuildingCloudError(ValueError):
+    """Raised when completeness is not established; downstream stops.
+
+    The measured points are carried unmodified for DIAGNOSTIC inspection
+    only; they must never feed authoritative reconstruction.
+    """
+
+    def __init__(self, message: str, ground_xyz: np.ndarray,
+                 building_points_xyz: np.ndarray,
+                 completeness: CloudCompleteness) -> None:
+        super().__init__(message)
+        self.ground_xyz = ground_xyz
+        self.building_points_xyz = building_points_xyz   # partial, non-authoritative
+        self.completeness = completeness
 
 
 @dataclass
@@ -146,8 +228,18 @@ class BuildingExtractionResult:
     las_path: str
     num_ground_points: int
     num_building_points: int
+    # AUTHORITATIVE: exact measured XYZ of every point positively
+    # identified as building evidence by the LAS classification (no
+    # rounding, resampling, or added points). It is the COMPLETE building
+    # cloud ONLY if ``completeness.established``; otherwise it is a
+    # NON-AUTHORITATIVE partial cloud (unresolved points were left out,
+    # neither guessed as building nor discarded from the file). Surface-
+    # evidence / floor results below are subsets / metadata and never
+    # replace this cloud.
+    building_points_xyz: np.ndarray = field(repr=False)   # (N_b, 3)
+    completeness: CloudCompleteness
     floors: FloorSlabResult
-    roof: RoofSurfaceResult
+    surface_evidence: SurfaceEvidenceResult
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -156,7 +248,9 @@ class BuildingExtractionResult:
 
 def load_and_filter_las(
     las_path: Path,
-) -> tuple[np.ndarray, np.ndarray]:
+    building_classes: tuple[int, ...] = BUILDING_EVIDENCE_CLASSES,
+    non_building_classes: tuple[int, ...] = KNOWN_NON_BUILDING_CLASSES,
+) -> tuple[np.ndarray, np.ndarray, CloudCompleteness]:
     """
     Read a .las / .laz file and separate Building vs Ground points.
 
@@ -164,27 +258,50 @@ def load_and_filter_las(
     ----------
     las_path : Path
         Path to the input LAS/LAZ file.
+    building_classes : tuple[int, ...]
+        LAS classes identified as building evidence (default: the
+        standard Building class). Must not include Ground (class 2).
+    non_building_classes : tuple[int, ...]
+        LAS classes definitively known NOT to be building (default:
+        ``KNOWN_NON_BUILDING_CLASSES``). Ambiguous classes (e.g. 8 Model Key-point, 12 Overlap Points)
+        may be added here by the caller only if the dataset guarantees
+        they contain no building geometry; otherwise they remain
+        unresolved. Must not overlap ``building_classes``.
 
     Returns
     -------
     ground_xyz : ndarray, shape (N_g, 3)
         XYZ coordinates of points classified as Ground (ASPRS 2).
     building_xyz : ndarray, shape (N_b, 3)
-        XYZ coordinates of points classified as Building (ASPRS 6).
+        Exact measured XYZ of EVERY point whose LAS class is in
+        ``building_classes`` (the authoritative building cloud). Points
+        of other classes are not building evidence and are never added.
+    completeness : CloudCompleteness
+        Whether the classification establishes that this cloud is the
+        complete building cloud (see ``KNOWN_NON_BUILDING_CLASSES``).
+        Below the failure thresholds the cloud is still returned but is
+        marked non-authoritative when completeness is not established.
 
     Raises
     ------
     FileNotFoundError
         If *las_path* does not exist.
     ValueError
-        If the file contains zero building points (nothing to process).
+        If the LAS classification cannot reliably separate building from
+        ground (no ground points, or too many unclassified points), if
+        ``building_classes`` includes Ground, or if the file contains zero
+        building points (nothing to process).
 
     Notes
     -----
     ASPRS classification is embedded in the point record's
     ``classification`` field.  Vendors sometimes use non-standard
-    codes; this function logs a warning if many points are
-    unclassified (class 0 or 1).
+    codes: list them in ``building_classes``. Unclassified points
+    (class 0/1) cannot be identified as building and are excluded from
+    both clouds and leave completeness unestablished; their count is
+    logged, and ingestion fails when they exceed
+    ``MAX_UNCLASSIFIED_FRACTION`` of the file (early safety check only;
+    completeness is decided by the unresolved-class check).
     """
     if not las_path.exists():
         raise FileNotFoundError(f"LAS file not found: {las_path}")
@@ -214,32 +331,70 @@ def load_and_filter_las(
         log.info("    class %2d : %10s pts  (%.1f%%)", unique_classes[ci], f"{counts[ci]:,}", pct)
 
     # ── Filter by ASPRS class ────────────────────────────────────
+    if ASPRS_GROUND in building_classes:
+        raise ValueError("building_classes must not include Ground (class 2).")
+    if set(building_classes) & set(non_building_classes):
+        raise ValueError("building_classes and non_building_classes overlap.")
     ground_mask   = classifications == ASPRS_GROUND
-    building_mask = classifications == ASPRS_BUILDING
+    building_mask = np.isin(classifications, building_classes)
 
     ground_xyz   = np.column_stack((x[ground_mask],   y[ground_mask],   z[ground_mask]))
     building_xyz = np.column_stack((x[building_mask], y[building_mask], z[building_mask]))
 
     log.info("  Ground   (class %d): %s pts", ASPRS_GROUND,   f"{len(ground_xyz):,}")
-    log.info("  Building (class %d): %s pts", ASPRS_BUILDING, f"{len(building_xyz):,}")
+    log.info("  Building (classes %s): %s pts", list(building_classes), f"{len(building_xyz):,}")
 
-    # ── Warn if very few classified points ───────────────────────
-    unclassified_count = np.sum((classifications == 0) | (classifications == 1))
-    if unclassified_count > 0.5 * total_points:
+    # ── Fail explicitly if building-vs-ground classification is unreliable ──
+    unclassified_count = int(np.isin(classifications, ASPRS_UNCLASSIFIED).sum())
+    if unclassified_count > MAX_UNCLASSIFIED_FRACTION * total_points:
+        raise ValueError(
+            f"{100.0 * unclassified_count / total_points:.0f}% of points in "
+            f"{las_path.name} are unclassified (class 0/1); the LAS "
+            f"classification cannot reliably separate building from ground. "
+            f"Classify the file (e.g., PDAL / LAStools) first."
+        )
+    if len(ground_xyz) == 0:
+        raise ValueError(
+            f"No ground points (ASPRS class {ASPRS_GROUND}) in {las_path.name}; "
+            f"building-vs-ground classification is unavailable, so the "
+            f"building cloud cannot be treated as complete."
+        )
+    # ── Completeness: only established if every point is accounted for ──
+    resolved = (building_mask
+                | np.isin(classifications, non_building_classes)
+                | (classifications == ASPRS_GROUND))
+    unresolved_classes = {
+        int(c): int(n) for c, n in zip(*np.unique(classifications[~resolved],
+                                                  return_counts=True))
+    }
+    unresolved_points = int(sum(unresolved_classes.values()))
+    if unresolved_points == 0:
+        completeness = CloudCompleteness(
+            True, 0, {},
+            "every point is assigned to a building or known non-building class",
+        )
+    else:
+        completeness = CloudCompleteness(
+            False, unresolved_points, unresolved_classes,
+            f"{unresolved_points:,} points have unresolved classes "
+            f"{unresolved_classes}; building geometry may exist outside "
+            f"the identified building classes",
+        )
         log.warning(
-            "  ⚠️  %.0f%% of points are unclassified (class 0/1). "
-            "The LAS file may need pre-processing with PDAL or LAStools.",
-            100.0 * unclassified_count / total_points,
+            "  ⚠️  Building-cloud completeness NOT established: %s. Points "
+            "are neither treated as building nor discarded from the file; "
+            "the building cloud is NON-AUTHORITATIVE (partial).",
+            completeness.reason,
         )
 
     if len(building_xyz) == 0:
         raise ValueError(
-            f"No building points (ASPRS class {ASPRS_BUILDING}) found in "
+            f"No building points (LAS classes {list(building_classes)}) found in "
             f"{las_path.name}.  Run a classification tool (e.g., PDAL "
             f"'filters.smrf' + 'filters.hag') first, or verify the file."
         )
 
-    return ground_xyz, building_xyz
+    return ground_xyz, building_xyz, completeness
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -254,6 +409,10 @@ def detect_floor_slabs(
     """
     Detect physical floor-slab elevations from a building's Z-axis
     point distribution.
+
+    METADATA / PROVENANCE ONLY: this is a 1-D Z histogram. Its outputs
+    (z_min, z_max, ground elevation, floor elevations) never generate or
+    position geometry.
 
     Algorithm
     ---------
@@ -270,7 +429,7 @@ def detect_floor_slabs(
     Why this works
     ──────────────
     Airborne LiDAR returns dense clusters of points at hard horizontal
-    surfaces (ground, concrete slabs, roof decks).  These show up as
+    surfaces (ground, concrete slabs, upper decks).  These show up as
     sharp peaks in the vertical histogram.  Walls produce a diffuse
     spread between peaks.
 
@@ -355,13 +514,11 @@ def detect_floor_slabs(
 
 
 # ════════════════════════════════════════════════════════════════════
-# §5  ROOF SURFACE EXTRACTION
-#     a) RANSAC Plane Fitting  → OGC POLYHEDRALSURFACE Z
-#     b) Delaunay TIN Fallback → OGC TIN Z
+# §5  CANDIDATE SURFACE EVIDENCE (measured XYZ; no surface is generated)
 # ════════════════════════════════════════════════════════════════════
 
 # ────────────────────────────────────────────────────────────────────
-# §5a  RANSAC Plane Fitting
+# §5a  RANSAC plane (DIAGNOSTIC / METADATA ONLY)
 # ────────────────────────────────────────────────────────────────────
 
 def _fit_plane_ransac(
@@ -370,18 +527,19 @@ def _fit_plane_ransac(
     """
     Fit a plane Ax + By + Cz + D = 0 to 3-D points using RANSAC.
 
-    Implementation note
-    ───────────────────
-    Scikit-learn's RANSACRegressor operates on 2-D feature → 1-D
-    target, so we treat (X, Y) as features and Z as the target:
+    DIAGNOSTIC ONLY: the plane describes the candidate surface evidence
+    for metadata; it is never used to generate or replace geometry, and
+    no point is filtered, moved, or deleted (``points`` is read-only).
 
-        Z ≈ aX + bY + c
-
-    This is equivalent to the plane equation:
-
-        aX + bY − Z + c = 0   →   A=a, B=b, C=−1, D=c
-
-    We then normalise so that (A² + B² + C²) = 1.
+    True 3-D fit
+    ────────────
+    The plane is fitted directly in (X, Y, Z) with an orientation-free
+    point-to-plane distance, so vertical, slanted, curved and arbitrary-
+    orientation surfaces are handled (no Z = f(X, Y) regression, no XY
+    projection). Each trial builds a plane from 3 random measured points;
+    the plane with the most inliers (distance <=
+    ``RANSAC_RESIDUAL_THRESHOLD_M``) is refined by a total-least-squares
+    (SVD) fit on those inliers, then normalised so (A² + B² + C²) = 1.
 
     Parameters
     ----------
@@ -397,34 +555,43 @@ def _fit_plane_ransac(
         (metres).  A large value indicates the surface is not planar.
     residuals : ndarray, shape (N,)
         Per-point signed distance to the plane.
+
+    Raises
+    ------
+    ValueError
+        If no non-degenerate plane can be formed (diagnostic unavailable).
     """
-    X_feat = points[:, :2]   # (N, 2) → [X, Y]
-    Z_tgt  = points[:, 2]    # (N,)   → Z
+    n = len(points)
+    if n < 3:
+        raise ValueError("Need at least 3 points for a plane fit.")
 
-    ransac = RANSACRegressor(
-        residual_threshold=RANSAC_RESIDUAL_THRESHOLD_M,
-        max_trials=RANSAC_MAX_TRIALS,
-        random_state=42,
-    )
-    ransac.fit(X_feat, Z_tgt)
+    rng = np.random.default_rng(42)
+    best_inliers = None
+    best_count = 0
+    for _ in range(RANSAC_MAX_TRIALS):
+        p0, p1, p2 = points[rng.choice(n, size=3, replace=False)]
+        normal = np.cross(p1 - p0, p2 - p0)
+        length = np.linalg.norm(normal)
+        if length < 1e-12:                     # collinear sample
+            continue
+        normal /= length
+        inliers = np.abs((points - p0) @ normal) <= RANSAC_RESIDUAL_THRESHOLD_M
+        count = int(inliers.sum())
+        if count > best_count:
+            best_count, best_inliers = count, inliers
 
-    # Extract coefficients:  Z = a·X + b·Y + c
-    a = float(ransac.estimator_.coef_[0])
-    b = float(ransac.estimator_.coef_[1])
-    c = float(ransac.estimator_.intercept_)
+    if best_inliers is None or best_count < 3:
+        raise ValueError("RANSAC could not find a valid plane.")
 
-    # Convert to Ax + By + Cz + D = 0 form
-    A_raw, B_raw, C_raw, D_raw = a, b, -1.0, c
+    # Total-least-squares refinement on the consensus set (3-D SVD).
+    inl = points[best_inliers]
+    centroid = inl.mean(axis=0)
+    normal = np.linalg.svd(inl - centroid, full_matrices=False)[2][-1]
+    A, B, C = (float(v) for v in normal)       # already unit length
+    D = float(-normal @ centroid)
 
-    # Normalise the normal vector to unit length
-    norm = math.sqrt(A_raw**2 + B_raw**2 + C_raw**2)
-    A = A_raw / norm
-    B = B_raw / norm
-    C = C_raw / norm
-    D = D_raw / norm
-
-    # Per-point signed distance from the plane
-    residuals = (A * points[:, 0] + B * points[:, 1] + C * points[:, 2] + D)
+    # Per-point signed distance from the plane (all points, read-only)
+    residuals = points @ normal + D
     mean_residual = float(np.mean(np.abs(residuals)))
 
     return (A, B, C, D), mean_residual, residuals
@@ -432,7 +599,7 @@ def _fit_plane_ransac(
 
 def _plane_pitch_angle(A: float, B: float, C: float) -> float:
     """
-    Compute the roof pitch angle (degrees) from the plane normal.
+    Compute the fitted plane's pitch angle (degrees) from its normal (diagnostic).
 
     The normal vector of the plane Ax + By + Cz + D = 0 is (A, B, C).
     The pitch is the angle between this normal and the vertical
@@ -440,8 +607,8 @@ def _plane_pitch_angle(A: float, B: float, C: float) -> float:
 
         cos(θ) = |C| / √(A² + B² + C²)
 
-    For a perfectly flat roof, θ = 0°.
-    For a 45° pitched roof, θ = 45°.
+    For a horizontal plane, θ = 0°.
+    For a 45° inclined plane, θ = 45°.
     """
     cos_theta = abs(C) / math.sqrt(A**2 + B**2 + C**2)
     # Clamp to avoid numerical issues with acos
@@ -450,300 +617,181 @@ def _plane_pitch_angle(A: float, B: float, C: float) -> float:
 
 
 # ────────────────────────────────────────────────────────────────────
-# §5b  Delaunay TIN Surface (fallback for curved / organic roofs)
+# §5b  Candidate exposed-surface evidence selection
 # ────────────────────────────────────────────────────────────────────
 
-def _build_tin_surface(
-    points: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Build a 2.5-D Triangulated Irregular Network (TIN) from 3-D
-    points by projecting to the XY plane for Delaunay triangulation,
-    then lifting the triangles back to their original Z values.
-
-    Parameters
-    ----------
-    points : ndarray, shape (N, 3)
-        3-D roof point coordinates.
-
-    Returns
-    -------
-    vertices : ndarray, shape (N, 3)
-        Same as input *points* (kept for symmetry).
-    simplices : ndarray, shape (T, 3)
-        Triangle vertex indices from the Delaunay triangulation.
-
-    Notes
-    -----
-    2.5-D means every (X, Y) has exactly one Z value (no overhangs).
-    This is standard for rooftop surfaces derived from nadir LiDAR.
-    """
-    # Delaunay triangulation operates on the 2-D (X, Y) projection.
-    tri = Delaunay(points[:, :2])
-
-    log.info("    TIN: %d triangles from %d vertices", len(tri.simplices), len(points))
-
-    return points, tri.simplices
-
-
-# ────────────────────────────────────────────────────────────────────
-# §5c  OGC WKT Generation (POLYHEDRALSURFACE Z / TIN Z)
-# ────────────────────────────────────────────────────────────────────
-
-def _generate_polyhedralsurface_wkt(
-    plane: tuple[float, float, float, float],
+def _select_surface_evidence_points(
     building_xyz: np.ndarray,
-    floor_elevations: list[float],
-    ground_elevation: float,
-) -> str:
+    k: int = SURFACE_EVIDENCE_KNN,
+) -> np.ndarray:
     """
-    Generate an OGC POLYHEDRALSURFACE Z WKT for a building with a
-    planar roof.
+    Select measured points on exposed, locally surface-like 3-D sheets
+    (candidate evidence only; roofs are not distinguished from facades).
 
-    Strategy
-    --------
-    For a simple extruded building the POLYHEDRALSURFACE is a closed
-    shell of planar faces:
-      • 1 ground polygon   (at ground_elevation)
-      • 1 roof polygon     (at z_max, tilted per the RANSAC plane)
-      • 4 wall polygons    (vertical, connecting ground to roof)
+    Each point's own k nearest neighbours (in true XYZ) give a local
+    covariance; a point is kept when
 
-    The 2-D footprint is approximated by the convex hull of the
-    building points projected to XY.  For production use this would
-    be replaced by the simplified polygon from train_2d_yolo.py.
+      * its neighbourhood is SURFACE-like (2-D dominant, not a line or
+        volumetric scatter), and
+      * at least one side of that sheet has a wide-open 3-D view (see
+        exposure test below).
 
-    Parameters
-    ----------
-    plane : tuple
-        (A, B, C, D) normalised plane equation.
-    building_xyz : ndarray, shape (N, 3)
-        Building-classified points.
-    floor_elevations : list[float]
-        Detected slab Z values.
-    ground_elevation : float
-        Ground reference Z.
+    No wall-vs-roof classification is made and there is no slope /
+    Z-orientation rule: steep, vertical, curved and folded surfaces are
+    eligible. Without a gravity or semantic reference an exposed facade
+    cannot be told from a roof, so facades may be included; this is
+    candidate evidence only, not a roof label.
 
-    Returns
-    -------
-    str
-        OGC WKT string:  ``POLYHEDRALSURFACE Z ((...), ...)``
+    Nothing is sliced by elevation and nothing is projected to XY, so
+    multiple surface sheets, overhangs, curved / slanted surfaces, and
+    several Z values at the same XY all keep their measured points.
+    Nothing is connected, triangulated, or fitted: the returned array is
+    a subset of ``building_xyz`` with unmodified coordinates, ready for
+    downstream OpenCASCADE surface / B-Rep reconstruction.
     """
-    from shapely.geometry import MultiPoint
+    pts = building_xyz
+    n = len(pts)
+    if n < k + 1:
+        return pts[:0]
 
-    # ── 2-D convex hull of the building footprint ────────────────
-    xy = building_xyz[:, :2]
-    hull = MultiPoint(xy).convex_hull
+    tree = cKDTree(pts)
+    nn_dist, nn_idx = tree.query(pts, k=k + 1)     # column 0 is the point
+    keep = np.zeros(n, dtype=bool)
+    normals = np.zeros((n, 3))   # unit local normals, sign arbitrary
 
-    if hull.geom_type != "Polygon":
-        # Degenerate case (all points collinear or coincident)
-        return "POLYHEDRALSURFACE Z EMPTY"
+    chunk = 200_000                                 # bounds memory only
+    for lo in range(0, n, chunk):
+        hi = min(lo + chunk, n)
+        nb = pts[nn_idx[lo:hi]]                     # (m, k+1, 3)
+        centred = nb - nb.mean(axis=1, keepdims=True)
+        cov = np.einsum("nki,nkj->nij", centred, centred) / k
+        evals, evecs = np.linalg.eigh(cov)          # ascending
+        sv = np.sqrt(np.clip(evals, 0.0, None))
+        s2 = np.where(sv[:, 2] > 1e-12, sv[:, 2], 1e-12)
+        a1 = (sv[:, 2] - sv[:, 1]) / s2             # line-like
+        a2 = (sv[:, 1] - sv[:, 0]) / s2             # surface-like
+        a3 = sv[:, 0] / s2                          # volumetric scatter
+        surface_like = (sv[:, 2] > 1e-12) & (a2 >= a1) & (a2 >= a3)
+        keep[lo:hi] = surface_like                   # no wall / roof / slope classification
+        normals[lo:hi] = evecs[:, :, 0]              # smallest-variance axis
 
-    # Exterior ring (already closed by Shapely)
-    ring_2d = list(hull.exterior.coords)  # [(x,y), …]
+    # ── 3-D exposure / occlusion test (topological context) ──────────
+    # For each side of a candidate's own normal, march thin tubes along the
+    # normal and along a cone of tilted rays through the FULL measured
+    # cloud. A side is open only if every ray is unobstructed; a candidate
+    # with no open side is ambiguous and stays unlabelled. The normal's
+    # sign is never oriented (no Z or other global direction is assumed).
+    # Selection heuristic only: rejected points remain measured points in
+    # the ``building_points_xyz`` cloud, and every point
+    # (candidate or not) still acts as an occluder. Coordinates untouched.
+    rt = SURFACE_TUBE_RADIUS_FACTOR * float(np.median(nn_dist[:, k]))
+    if not np.isfinite(rt) or rt <= 0.0:
+        return pts[:0]        # no evidence; measured cloud is unaffected
+    reach = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
 
-    A, B, C, D = plane
-    z_max = float(np.max(building_xyz[:, 2]))
+    # tangent basis (t1, t2) perpendicular to each normal
+    helper = np.where(np.abs(normals[:, :1]) < 0.9,
+                      np.array([[1.0, 0.0, 0.0]]), np.array([[0.0, 1.0, 0.0]]))
+    t1 = np.cross(normals, helper)
+    t1 /= np.linalg.norm(t1, axis=1, keepdims=True).clip(1e-12)
+    t2 = np.cross(normals, t1)
+    tilt = math.radians(SURFACE_CONE_HALF_ANGLE_DEG)
+    phis = np.linspace(0.0, 2.0 * math.pi, SURFACE_CONE_RAYS, endpoint=False)
 
-    # ── Helper: Z on the roof plane at a given (x, y) ────────────
-    def _roof_z(x: float, y: float) -> float:
-        """Evaluate the RANSAC plane: z = -(Ax + By + D) / C."""
-        if abs(C) < 1e-12:
-            return z_max   # near-vertical plane fallback
-        return -(A * x + B * y + D) / C
+    def _side_open(cand: np.ndarray, sign: float) -> np.ndarray:
+        """Boolean mask over ``cand``: side ``sign`` is fully unobstructed."""
+        is_open = np.ones(len(cand), dtype=bool)
+        dirs = [sign * normals[cand]]
+        for phi in phis:
+            dirs.append(sign * (math.cos(tilt) * normals[cand]
+                                + math.sin(tilt) * (math.cos(phi) * t1[cand]
+                                                    + math.sin(phi) * t2[cand])))
+        for d in dirs:
+            live = np.flatnonzero(is_open)
+            t = 2.0 * rt      # start clear of the candidate's own surface
+            while len(live) and t <= reach:
+                dist, _ = tree.query(pts[cand[live]] + d[live] * t, k=1,
+                                     distance_upper_bound=rt, workers=-1)
+                hit = np.isfinite(dist)
+                is_open[live[hit]] = False
+                live = live[~hit]
+                t += rt
+        return is_open
 
-    # ── Build WKT patches ────────────────────────────────────────
-    patches: list[str] = []
+    cand = np.flatnonzero(keep)
+    open_pos = _side_open(cand, 1.0)
+    rest = ~open_pos
+    open_neg = np.zeros(len(cand), dtype=bool)
+    open_neg[rest] = _side_open(cand[rest], -1.0)
+    keep[:] = False
+    keep[cand[open_pos | open_neg]] = True
 
-    # Ground face (horizontal at ground_elevation)
-    ground_coords = ", ".join(
-        f"{x:.2f} {y:.2f} {ground_elevation:.2f}" for x, y in ring_2d
-    )
-    patches.append(f"(({ground_coords}))")
-
-    # Roof face (on the RANSAC plane)
-    roof_coords = ", ".join(
-        f"{x:.2f} {y:.2f} {_roof_z(x, y):.2f}" for x, y in ring_2d
-    )
-    patches.append(f"(({roof_coords}))")
-
-    # Wall faces (one per edge of the footprint ring)
-    for i in range(len(ring_2d) - 1):
-        x1, y1 = ring_2d[i]
-        x2, y2 = ring_2d[i + 1]
-        gz = ground_elevation
-        rz1 = _roof_z(x1, y1)
-        rz2 = _roof_z(x2, y2)
-        # A wall quad: bottom-left → bottom-right → top-right → top-left → close
-        wall = (
-            f"(({x1:.2f} {y1:.2f} {gz:.2f}, "
-            f"{x2:.2f} {y2:.2f} {gz:.2f}, "
-            f"{x2:.2f} {y2:.2f} {rz2:.2f}, "
-            f"{x1:.2f} {y1:.2f} {rz1:.2f}, "
-            f"{x1:.2f} {y1:.2f} {gz:.2f}))"
-        )
-        patches.append(wall)
-
-    wkt = "POLYHEDRALSURFACE Z (" + ", ".join(patches) + ")"
-    return wkt
-
-
-def _generate_tin_z_wkt(
-    vertices: np.ndarray,
-    simplices: np.ndarray,
-    max_triangles: int = 500,
-) -> str:
-    """
-    Generate an OGC TIN Z WKT from Delaunay triangulation results.
-
-    Parameters
-    ----------
-    vertices : ndarray, shape (N, 3)
-        3-D vertex coordinates.
-    simplices : ndarray, shape (T, 3)
-        Triangle vertex indices.
-    max_triangles : int
-        Cap on the number of triangles in the WKT to keep the string
-        manageable.  In production the full TIN would be written to a
-        binary format (e.g., CityGML, glTF).
-
-    Returns
-    -------
-    str
-        OGC WKT:  ``TIN Z (((…)), ((…)), …)``
-    """
-    tri_strings: list[str] = []
-    for tri_idx in simplices[:max_triangles]:
-        # Each triangle is a closed ring of 4 coordinates (3 + repeat first)
-        v0, v1, v2 = vertices[tri_idx]
-        coords = (
-            f"{v0[0]:.2f} {v0[1]:.2f} {v0[2]:.2f}, "
-            f"{v1[0]:.2f} {v1[1]:.2f} {v1[2]:.2f}, "
-            f"{v2[0]:.2f} {v2[1]:.2f} {v2[2]:.2f}, "
-            f"{v0[0]:.2f} {v0[1]:.2f} {v0[2]:.2f}"
-        )
-        tri_strings.append(f"(({coords}))")
-
-    wkt = "TIN Z (" + ", ".join(tri_strings) + ")"
-    return wkt
-
+    return pts[keep]
 
 # ────────────────────────────────────────────────────────────────────
-# §5d  Top-level roof extractor
+# §5c  Top-level surface-evidence extractor
 # ────────────────────────────────────────────────────────────────────
 
-def extract_roof_surface(
-    building_xyz: np.ndarray,
-    floor_elevations: list[float],
-    ground_elevation: float,
-    roof_slice_m: float = ROOF_SLICE_THICKNESS_M,
-) -> RoofSurfaceResult:
+def extract_surface_evidence(building_xyz: np.ndarray) -> SurfaceEvidenceResult:
     """
-    Extract the roof surface from the building point cloud.
+    Extract candidate exposed-surface evidence from the building point cloud.
 
-    Workflow
-    --------
-    1. Slice the topmost ``roof_slice_m`` metres of the building
-       point cloud.
-    2. Attempt RANSAC plane fitting.
-    3. If the mean residual is acceptable → planar roof →
-       ``POLYHEDRALSURFACE Z``.
-    4. If the residual is too high → curved/organic roof →
-       Delaunay TIN → ``TIN Z``.
+    ``surface_evidence_xyz`` is a raw measured-XYZ SUBSET (candidate evidence, not a roof label; ``roof_label_authoritative`` is False),
+    unmodified. The RANSAC plane, pitch, and residual are diagnostics
+    only. No triangulation, hull, extrusion, or WKT is produced here.
 
     Parameters
     ----------
     building_xyz : ndarray, shape (N, 3)
         Building-classified points.
-    floor_elevations : list[float]
-        Detected slab Z values (for WKT generation).
-    ground_elevation : float
-        Ground reference Z.
-    roof_slice_m : float
-        Thickness of the roof slice in metres.
 
     Returns
     -------
-    RoofSurfaceResult
+    SurfaceEvidenceResult
     """
-    log.info("═══ Roof Surface Extraction ═══")
+    log.info("═══ Candidate Surface Evidence ═══")
 
-    z_max = float(np.max(building_xyz[:, 2]))
-    z_cut = z_max - roof_slice_m
+    evidence_pts = _select_surface_evidence_points(building_xyz)
+    log.info("  Candidate exposed-surface points: %s of %s building pts",
+             f"{len(evidence_pts):,}", f"{len(building_xyz):,}")
 
-    # ── Extract the roof slice ───────────────────────────────────
-    roof_mask = building_xyz[:, 2] >= z_cut
-    roof_pts  = building_xyz[roof_mask]
-    log.info("  Roof slice: Z ≥ %.2f m → %s pts", z_cut, f"{len(roof_pts):,}")
-
-    if len(roof_pts) < 10:
-        log.warning("  ⚠️  Too few roof points (%d). Cannot fit surface.", len(roof_pts))
-        return RoofSurfaceResult(
+    if len(evidence_pts) < 10:
+        log.warning("  ⚠️  Too few surface-evidence points (%d). No diagnostics computed.",
+                    len(evidence_pts))
+        return SurfaceEvidenceResult(
+            surface_evidence_xyz=evidence_pts,
             plane_coefficients=None,
             pitch_angle_deg=None,
-            is_curved=True,
+            is_curved=None,
             ransac_mean_residual=None,
-            tin_vertices=None,
-            tin_simplices=None,
-            ogc_wkt="TIN Z EMPTY",
         )
 
-    # ── RANSAC plane fitting ─────────────────────────────────────
-    (A, B, C, D), mean_res, residuals = _fit_plane_ransac(roof_pts)
+    # ── RANSAC plane: diagnostic only, must never block the evidence ──
+    try:
+        (A, B, C, D), mean_res, _ = _fit_plane_ransac(evidence_pts)
+    except ValueError as exc:
+        log.warning("  RANSAC diagnostic unavailable: %s", exc)
+        return SurfaceEvidenceResult(
+            surface_evidence_xyz=evidence_pts,
+            plane_coefficients=None,
+            pitch_angle_deg=None,
+            is_curved=None,
+            ransac_mean_residual=None,
+        )
     pitch = _plane_pitch_angle(A, B, C)
 
-    log.info("  RANSAC plane: %.4f·x + %.4f·y + %.4f·z + %.4f = 0", A, B, C, D)
-    log.info("  Pitch angle : %.1f°", pitch)
-    log.info("  Mean |residual|: %.3f m  (threshold: %.3f m)",
-             mean_res, CURVED_ROOF_RESIDUAL_THRESHOLD_M)
+    log.info("  [diagnostic] RANSAC plane: %.4f·x + %.4f·y + %.4f·z + %.4f = 0", A, B, C, D)
+    log.info("  [diagnostic] Pitch angle : %.1f°", pitch)
+    log.info("  [diagnostic] Mean |residual|: %.3f m  (threshold: %.3f m)",
+             mean_res, CURVED_SURFACE_RESIDUAL_THRESHOLD_M)
 
-    # ── Decision: planar vs curved ───────────────────────────────
-    is_curved = mean_res > CURVED_ROOF_RESIDUAL_THRESHOLD_M
-
-    if is_curved:
-        # ── Curved / organic roof → Delaunay TIN ────────────────
-        log.info("  → Roof classified as CURVED/ORGANIC. Building TIN surface …")
-        tin_verts, tin_simps = _build_tin_surface(roof_pts)
-
-        # Sub-sample if the point cloud is massive (TIN WKT can be huge)
-        max_tin_pts = 2000
-        if len(roof_pts) > max_tin_pts:
-            log.info("    Sub-sampling roof points: %d → %d for TIN",
-                     len(roof_pts), max_tin_pts)
-            rng = np.random.default_rng(42)
-            idx = rng.choice(len(roof_pts), size=max_tin_pts, replace=False)
-            tin_verts_sub = roof_pts[idx]
-            _, tin_simps_sub = _build_tin_surface(tin_verts_sub)
-        else:
-            tin_verts_sub = tin_verts
-            tin_simps_sub = tin_simps
-
-        wkt = _generate_tin_z_wkt(tin_verts_sub, tin_simps_sub)
-
-        return RoofSurfaceResult(
-            plane_coefficients=(A, B, C, D),
-            pitch_angle_deg=pitch,
-            is_curved=True,
-            ransac_mean_residual=mean_res,
-            tin_vertices=tin_verts,
-            tin_simplices=tin_simps,
-            ogc_wkt=wkt,
-        )
-    else:
-        # ── Planar roof → POLYHEDRALSURFACE Z ────────────────────
-        log.info("  → Roof classified as PLANAR. Generating POLYHEDRALSURFACE Z …")
-        wkt = _generate_polyhedralsurface_wkt(
-            (A, B, C, D), building_xyz, floor_elevations, ground_elevation,
-        )
-
-        return RoofSurfaceResult(
-            plane_coefficients=(A, B, C, D),
-            pitch_angle_deg=pitch,
-            is_curved=False,
-            ransac_mean_residual=mean_res,
-            tin_vertices=None,
-            tin_simplices=None,
-            ogc_wkt=wkt,
-        )
+    return SurfaceEvidenceResult(
+        surface_evidence_xyz=evidence_pts,
+        plane_coefficients=(A, B, C, D),
+        pitch_angle_deg=pitch,
+        is_curved=mean_res > CURVED_SURFACE_RESIDUAL_THRESHOLD_M,
+        ransac_mean_residual=mean_res,
+    )
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -753,16 +801,18 @@ def extract_roof_surface(
 def process_las_file(
     las_path: Path,
     bin_size_m: float = DEFAULT_BIN_SIZE_M,
-    roof_slice_m: float = ROOF_SLICE_THICKNESS_M,
 ) -> BuildingExtractionResult:
     """
     Full Z-axis elevation extraction pipeline for a single LAS file.
+
+    Raises ``IncompleteBuildingCloudError`` (a ``ValueError``) before any
+    floor / surface extraction if completeness is not established.
 
     Steps
     ─────
     1. Load & filter points (Ground vs Building).
     2. Detect floor slabs via Z-histogram peak detection.
-    3. Extract roof surface (RANSAC plane / Delaunay TIN).
+    3. Select candidate exposed-surface evidence (raw XYZ; RANSAC = diagnostic).
     4. Package everything into a ``BuildingExtractionResult``.
 
     Parameters
@@ -771,33 +821,39 @@ def process_las_file(
         Input .las / .laz file.
     bin_size_m : float
         Histogram bin width for floor detection (metres).
-    roof_slice_m : float
-        Thickness of the roof slice (metres).
 
     Returns
     -------
     BuildingExtractionResult
     """
     # ── §3: Ingest ───────────────────────────────────────────────
-    ground_xyz, building_xyz = load_and_filter_las(las_path)
+    ground_xyz, building_xyz, completeness = load_and_filter_las(las_path)
+
+    # ── Stop before ANY downstream extraction on a partial cloud ─────
+    if not completeness.established:
+        raise IncompleteBuildingCloudError(
+            f"Building-cloud completeness not established for "
+            f"{las_path.name}: {completeness.reason}. Refusing to run "
+            f"floor / surface extraction on a partial, non-authoritative "
+            f"cloud. Configure building_classes / non_building_classes or "
+            f"classify the file.",
+            ground_xyz, building_xyz, completeness,
+        )
 
     # ── §4: Floor slabs ──────────────────────────────────────────
     floors = detect_floor_slabs(ground_xyz, building_xyz, bin_size_m=bin_size_m)
 
-    # ── §5: Roof surface ─────────────────────────────────────────
-    roof = extract_roof_surface(
-        building_xyz,
-        floor_elevations=floors.floor_elevations,
-        ground_elevation=floors.ground_elevation,
-        roof_slice_m=roof_slice_m,
-    )
+    # ── §5: Candidate surface evidence ─────────────────────────────────────────
+    surface_evidence = extract_surface_evidence(building_xyz)
 
     return BuildingExtractionResult(
         las_path=str(las_path),
         num_ground_points=len(ground_xyz),
         num_building_points=len(building_xyz),
+        building_points_xyz=building_xyz,
+        completeness=completeness,
         floors=floors,
-        roof=roof,
+        surface_evidence=surface_evidence,
     )
 
 
@@ -808,14 +864,16 @@ def process_las_file(
 def print_results(result: BuildingExtractionResult) -> None:
     """Pretty-print the extraction results to stdout."""
     f = result.floors
-    r = result.roof
+    r = result.surface_evidence
 
     print("\n" + "═" * 72)
     print("  3D Cadastre · Z-Axis Elevation Extraction Results")
     print("═" * 72)
     print(f"  LAS file         : {result.las_path}")
     print(f"  Ground points    : {result.num_ground_points:,}")
-    print(f"  Building points  : {result.num_building_points:,}")
+    print(f"  Building points  : {result.num_building_points:,} (identified as building)")
+    c = result.completeness
+    print(f"  Cloud complete   : {'YES (by classification)' if c.established else 'NOT ESTABLISHED – non-authoritative'}")
 
     print(f"\n── Floor Slabs ────────────────────────────────────")
     print(f"  Ground elevation : {f.ground_elevation:.2f} m")
@@ -827,21 +885,15 @@ def print_results(result: BuildingExtractionResult) -> None:
         agl = fz - f.ground_elevation
         print(f"    Floor {i}: Z = {fz:.2f} m  ({agl:.1f} m AGL)")
 
-    print(f"\n── Roof Surface ───────────────────────────────────")
+    print(f"\n── Candidate Surface Evidence (measured XYZ) ───────────")
+    print(f"  Surface evidence : {len(r.surface_evidence_xyz):,} (candidate, not a roof label)")
     if r.plane_coefficients:
         A, B, C, D = r.plane_coefficients
-        print(f"  Plane equation   : {A:.4f}x + {B:.4f}y + {C:.4f}z + {D:.4f} = 0")
+        print(f"  [diagnostic] plane : {A:.4f}x + {B:.4f}y + {C:.4f}z + {D:.4f} = 0")
     if r.pitch_angle_deg is not None:
-        print(f"  Pitch angle      : {r.pitch_angle_deg:.1f}°")
+        print(f"  [diagnostic] pitch : {r.pitch_angle_deg:.1f}°")
     if r.ransac_mean_residual is not None:
-        print(f"  RANSAC residual  : {r.ransac_mean_residual:.3f} m")
-    print(f"  Curved / organic : {'Yes → TIN Z' if r.is_curved else 'No → POLYHEDRALSURFACE Z'}")
-
-    # Truncate WKT for display
-    wkt_display = r.ogc_wkt
-    if len(wkt_display) > 200:
-        wkt_display = wkt_display[:197] + "…"
-    print(f"  OGC WKT          : {wkt_display}")
+        print(f"  [diagnostic] RANSAC residual : {r.ransac_mean_residual:.3f} m")
     print("═" * 72)
 
 
@@ -859,7 +911,7 @@ def export_results_json(
         Destination .json file.
     """
     f = result.floors
-    r = result.roof
+    r = result.surface_evidence
 
     data = {
         "project": "3D Cadastre – SIH 26011",
@@ -867,6 +919,13 @@ def export_results_json(
         "points": {
             "ground": result.num_ground_points,
             "building": result.num_building_points,
+        },
+        "building_cloud": {
+            "authoritative_complete": result.completeness.established,
+            "unresolved_points": result.completeness.unresolved_points,
+            "unresolved_classes": {str(k): v for k, v in
+                                   result.completeness.unresolved_classes.items()},
+            "reason": result.completeness.reason,
         },
         "floors": {
             "ground_elevation_m": f.ground_elevation,
@@ -876,7 +935,8 @@ def export_results_json(
             "num_floors": f.num_floors_detected,
             "slab_elevations_m": f.floor_elevations,
         },
-        "roof": {
+        "surface_evidence": {
+            "roof_label_authoritative": False,   # no external roof semantics
             "plane_equation": (
                 {"A": r.plane_coefficients[0], "B": r.plane_coefficients[1],
                  "C": r.plane_coefficients[2], "D": r.plane_coefficients[3]}
@@ -885,8 +945,8 @@ def export_results_json(
             "pitch_angle_deg": r.pitch_angle_deg,
             "ransac_mean_residual_m": r.ransac_mean_residual,
             "is_curved": r.is_curved,
-            "geometry_type": "TIN Z" if r.is_curved else "POLYHEDRALSURFACE Z",
-            "ogc_wkt": r.ogc_wkt,
+            "evidence_points": int(len(r.surface_evidence_xyz)),
+            "diagnostic_only": True,   # plane / pitch / residual: not geometry
         },
     }
 
@@ -906,7 +966,7 @@ def plot_results(
     """
     Generate a 2-panel diagnostic plot:
       Left  : Z-axis histogram with detected floor-slab peaks.
-      Right : 3-D scatter of the roof slice with RANSAC plane / TIN.
+      Right : 3-D scatter of the candidate surface evidence (display only).
 
     Parameters
     ----------
@@ -922,7 +982,7 @@ def plot_results(
         return
 
     f = result.floors
-    r = result.roof
+    r = result.surface_evidence
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
     fig.suptitle(
@@ -947,32 +1007,13 @@ def plot_results(
     by_label = dict(zip(labels, handles))
     ax1.legend(by_label.values(), by_label.keys(), fontsize=8)
 
-    # ── Right panel: 3-D roof points ─────────────────────────────
+    # ── Right panel: candidate surface-evidence points (display only) ─
     ax2 = fig.add_subplot(1, 2, 2, projection="3d")
-
-    # Re-load roof points for the scatter
-    z_max_val = float(np.max(f.histogram_bins))
-    z_cut = z_max_val - ROOF_SLICE_THICKNESS_M
-
-    # We don't have building_xyz stored directly; approximate from
-    # the result.  For a real pipeline we'd pass it through.
-    # For the plot we just indicate the TIN / plane.
-    if r.tin_vertices is not None and r.tin_simplices is not None:
-        # Plot TIN surface
-        verts = r.tin_vertices
-        simps = r.tin_simplices
-        ax2.plot_trisurf(
-            verts[:, 0], verts[:, 1], verts[:, 2],
-            triangles=simps[:200],   # cap for performance
-            color="#E67E22", alpha=0.5, edgecolor="gray", linewidth=0.2,
-        )
-        ax2.set_title("Roof TIN Surface (Delaunay)")
-    elif r.plane_coefficients is not None:
-        A, B, C, D = r.plane_coefficients
-        ax2.set_title(f"RANSAC Roof Plane (pitch {r.pitch_angle_deg:.1f}°)")
-        ax2.text2D(0.05, 0.95,
-                   f"{A:.3f}x + {B:.3f}y + {C:.3f}z + {D:.3f} = 0",
-                   transform=ax2.transAxes, fontsize=8, color="red")
+    pts = r.surface_evidence_xyz
+    if len(pts):
+        shown = pts[:: max(1, len(pts) // 20000)]   # plot-only thinning
+        ax2.scatter(shown[:, 0], shown[:, 1], shown[:, 2], s=1, color="#E67E22")
+    ax2.set_title("Candidate surface evidence (raw XYZ subset)")
 
     ax2.set_xlabel("X (m)")
     ax2.set_ylabel("Y (m)")
@@ -995,7 +1036,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "SIH 26011 – Z-Axis Elevation Extraction from LiDAR .las files. "
-            "Detects floor slabs and roof surfaces for OGC 3D geometries."
+            "Detects floor slabs (metadata) and candidate exposed-surface points."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1015,8 +1056,8 @@ def main() -> None:
         help=f"Z-histogram bin width in metres (default: {DEFAULT_BIN_SIZE_M}).",
     )
     parser.add_argument(
-        "--roof-slice", type=float, default=ROOF_SLICE_THICKNESS_M,
-        help=f"Roof slice thickness in metres (default: {ROOF_SLICE_THICKNESS_M}).",
+        "--points-out", type=Path, default=None,
+        help="Save the identified building XYZ cloud (exact float64) as .npy; complete only if completeness is established.",
     )
     parser.add_argument(
         "--json-out", type=Path, default=None,
@@ -1051,7 +1092,6 @@ def main() -> None:
             result = process_las_file(
                 las_path,
                 bin_size_m=args.bin_size,
-                roof_slice_m=args.roof_slice,
             )
         except (FileNotFoundError, ValueError) as exc:
             log.error("  ❌  %s", exc)
@@ -1069,6 +1109,19 @@ def main() -> None:
                     f"{args.json_out.stem}_{las_path.stem}{args.json_out.suffix}"
                 )
             export_results_json(result, json_path)
+
+        # ── Save identified building XYZ (authoritative only if completeness established) ────────
+        if args.points_out:
+            points_path = args.points_out
+            if len(las_files) > 1:
+                points_path = args.points_out.with_name(
+                    f"{args.points_out.stem}_{las_path.stem}{args.points_out.suffix}"
+                )
+            points_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(points_path, result.building_points_xyz)
+            log.info("📐  Identified building XYZ saved (%s) → %s",
+                     "complete" if result.completeness.established
+                     else "NON-AUTHORITATIVE, completeness not established", points_path)
 
         # ── Plot ─────────────────────────────────────────────────
         if not args.no_plot:

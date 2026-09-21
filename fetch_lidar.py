@@ -7,8 +7,9 @@ Downloads sample urban LiDAR point-cloud data (.las / .laz) for the
 
 Strategy (3-tier waterfall)
 ───────────────────────────
-1. **OpenTopography REST API** – if an API key is provided.
-   Sign up free at https://opentopography.org → MyOpenTopo → API Key.
+1. **OpenTopography** – DISABLED as a data source: its DEM endpoints return
+   2.5D rasters (Z = f(X, Y)), not raw point clouds, and rasters must never
+   enter the 3D pipeline. This tier fails so the LAZ tiers below run.
 
 2. **USGS TNM Access API** – queries The National Map to discover
    LiDAR .laz tiles for any bounding box. No API key needed.
@@ -21,6 +22,10 @@ Output
   data/raw_lidar/
   ├── <descriptive_name>.las   (or .laz)
   └── metadata.json            (provenance info)
+
+Every successful download must be a raw LAS/LAZ point cloud (measured XYZ),
+verified by its "LASF" file signature. Nothing is ever converted from a
+DEM/DSM/raster into XYZ.
 
 Requirements
 ────────────
@@ -81,6 +86,16 @@ FALLBACK_URLS = [
 CHUNK_SIZE = 8192
 
 
+# ──────────────── raw point-cloud check ─────────────────────
+def _is_las_laz(path: Path) -> bool:
+    """True only for a LAS/LAZ file (raw measured XYZ): checks the 'LASF' signature."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"LASF"
+    except OSError:
+        return False
+
+
 # ──────────────── download helper ──────────────────────────
 def _download_file(url: str, dest: Path, description: str = "") -> bool:
     """Stream-download a file with a progress bar. Returns True on success."""
@@ -102,6 +117,11 @@ def _download_file(url: str, dest: Path, description: str = "") -> bool:
                 for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                     f.write(chunk)
                     bar.update(len(chunk))
+
+        if not _is_las_laz(dest):
+            dest.unlink()
+            print("     ❌  Not a LAS/LAZ point cloud (no 'LASF' header) -- discarded.")
+            return False
 
         size_mb = dest.stat().st_size / (1024 * 1024)
         print(f"     ✅  Saved ({size_mb:.1f} MB)")
@@ -125,59 +145,18 @@ def fetch_via_opentopography(
     output_dir: Path,
 ) -> bool:
     """
-    Request point-cloud data from the OpenTopography USGS 3DEP API.
+    DISABLED. This used to request GTiff from the OpenTopography DEM endpoint
+    (globaldem) and save it as LiDAR. That is a 2.5D elevation raster
+    (Z = f(X, Y)), not measured XYZ, and it is never a valid source for the
+    3D geometry pipeline; it is also never converted into points here.
 
-    API docs: https://portal.opentopography.org/apidocs/
+    Returns False without any request, so the USGS TNM / direct LAZ tiers
+    run. Re-enable only with an endpoint that returns raw LAS/LAZ point
+    clouds (the download must pass _is_las_laz).
     """
-    params = {
-        "demtype": "USGS3DEP",       # or specific dataset ID
-        "south":   bbox["south"],
-        "north":   bbox["north"],
-        "west":    bbox["west"],
-        "east":    bbox["east"],
-        "outputFormat": "GTiff",
-        "API_Key": api_key,
-    }
-
-    # Note: OpenTopography's point cloud API uses a different endpoint for
-    # raw LAZ.  The /API/usgsdem endpoint returns raster DEMs.
-    # For actual point clouds, the Global Data endpoint is:
-    pc_url = "https://portal.opentopography.org/API/globaldem"
-    params_pc = {
-        "demtype":      "SRTMGL1",
-        "south":        bbox["south"],
-        "north":        bbox["north"],
-        "west":         bbox["west"],
-        "east":         bbox["east"],
-        "outputFormat":  "GTiff",
-        "API_Key":       api_key,
-    }
-
-    print("🌐  Attempting OpenTopography API request ...")
-    print(f"     BBox: {bbox}")
-
-    dest = output_dir / "opentopography_sample.tif"
-    try:
-        resp = requests.get(pc_url, params=params_pc, stream=True, timeout=120)
-        resp.raise_for_status()
-
-        total = int(resp.headers.get("content-length", 0))
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        with open(dest, "wb") as f, tqdm(
-            total=total or None, unit="B", unit_scale=True, desc="  OT download"
-        ) as bar:
-            for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
-                f.write(chunk)
-                bar.update(len(chunk))
-
-        size_mb = dest.stat().st_size / (1024 * 1024)
-        print(f"     ✅  Saved ({size_mb:.1f} MB) → {dest}")
-        return True
-
-    except Exception as exc:
-        print(f"     ⚠️  OpenTopography request failed: {exc}")
-        return False
+    print("🌐  OpenTopography tier disabled: its DEM endpoints return 2.5D rasters, "
+          "not raw LAS/LAZ point clouds. Falling through to LAZ sources ...")
+    return False
 
 
 # ─────────── method 2: USGS TNM Access API ─────────────────
@@ -231,7 +210,7 @@ def fetch_via_tnm_api(
         safe_name = title.replace(" ", "_").replace("/", "_")[:80] + ext
         dest = output_dir / safe_name
 
-        if dest.exists():
+        if dest.exists() and _is_las_laz(dest):
             print(f"     ⏭  Already exists: {dest.name}")
             success_count += 1
             continue
@@ -255,7 +234,7 @@ def fetch_via_usgs_direct(output_dir: Path, max_files: int = 1) -> bool:
     success_count = 0
     for entry in FALLBACK_URLS[:max_files]:
         dest = output_dir / entry["filename"]
-        if dest.exists():
+        if dest.exists() and _is_las_laz(dest):
             print(f"     ⏭  Already exists: {dest.name}")
             success_count += 1
             continue
@@ -275,6 +254,7 @@ def _write_metadata(output_dir: Path, source: str, details: dict) -> None:
     meta = {
         "project":     "3D Cadastre – SIH 26011",
         "source":      source,
+        "data_type":   "raw LAS/LAZ point cloud (measured XYZ); no DEM/raster-derived geometry",
         "downloaded":  time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         **details,
     }

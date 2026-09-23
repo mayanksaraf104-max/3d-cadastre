@@ -1,0 +1,1150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>National 3D Cadastre — Survey Console</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0A0F14;
+    --bg-2:#0E151C;
+    --panel:#111A23;
+    --panel-2:#16212C;
+    --panel-3:#1B2835;
+    --line:rgba(150,180,200,0.10);
+    --line-strong:rgba(150,180,200,0.20);
+    --text:#E4ECF2;
+    --text-dim:#8497A6;
+    --text-faint:#5B6D7B;
+    --accent:#2DD4BF;
+    --accent-dim:#187E72;
+    --accent-2:#38BDF8;
+    --ok:#34D399;
+    --warn:#F5B84B;
+    --bad:#F26D5B;
+    --radius:6px;
+    --mono:'JetBrains Mono', ui-monospace, monospace;
+    --sans:'IBM Plex Sans', system-ui, sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:var(--bg);
+    background-image:
+      radial-gradient(1200px 500px at 85% -10%, rgba(45,212,191,0.07), transparent 60%),
+      radial-gradient(900px 500px at -10% 10%, rgba(56,189,248,0.06), transparent 60%);
+    color:var(--text);
+    font-family:var(--sans);
+    font-size:14px;
+    line-height:1.5;
+    min-height:100vh;
+  }
+  h1,h2,h3{margin:0;font-weight:600;}
+  a{color:var(--accent);}
+  .mono{font-family:var(--mono);}
+
+  /* ---------- top bar ---------- */
+  .topbar{
+    position:sticky;top:0;z-index:1000;
+    display:flex;align-items:center;gap:18px;flex-wrap:wrap;
+    padding:12px 24px;
+    background:rgba(10,15,20,0.88);
+    backdrop-filter:blur(10px);
+    border-bottom:1px solid var(--line-strong);
+  }
+  .brand{display:flex;align-items:center;gap:12px;}
+  .brand-mark{
+    width:32px;height:32px;border-radius:7px;
+    background:linear-gradient(135deg,var(--accent),var(--accent-2));
+    display:flex;align-items:center;justify-content:center;
+  }
+  .brand-mark svg{width:19px;height:19px;stroke:#04231F;fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round;}
+  .brand h1{font-size:15px;letter-spacing:.01em;}
+  .brand small{display:block;color:var(--text-dim);font-size:11.5px;font-weight:400;margin-top:-1px;}
+  .topbar .spacer{flex:1;}
+  .chip{
+    display:inline-flex;align-items:center;gap:8px;
+    font-family:var(--mono);font-size:11.5px;color:var(--text-dim);
+    padding:5px 10px;border:1px solid var(--line-strong);border-radius:999px;background:var(--panel);
+    white-space:nowrap;
+  }
+  .status-dot{width:8px;height:8px;border-radius:50%;background:var(--text-faint);}
+  .status-dot.online{background:var(--ok);box-shadow:0 0 0 3px rgba(52,211,153,0.18);}
+  .status-dot.offline{background:var(--bad);box-shadow:0 0 0 3px rgba(242,109,91,0.18);}
+
+  .wrap{max-width:1440px;margin:0 auto;padding:24px 24px 80px;}
+  .intro{margin-bottom:20px;}
+  .intro h2{font-size:22px;}
+  .intro p{margin:6px 0 0;color:var(--text-dim);max-width:86ch;font-size:13.5px;}
+
+  /* ---------- panels ---------- */
+  .panel{
+    background:var(--panel);
+    border:1px solid var(--line-strong);
+    border-radius:var(--radius);
+    overflow:hidden;
+  }
+  .panel-head{
+    display:flex;align-items:center;gap:10px;
+    padding:12px 16px;
+    background:var(--panel-2);
+    border-bottom:1px solid var(--line);
+  }
+  .panel-head .num{
+    font-family:var(--mono);font-size:11px;color:var(--accent);
+    border:1px solid var(--accent-dim);border-radius:4px;
+    padding:1px 6px;flex-shrink:0;
+  }
+  .panel-head h2{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--text);}
+  .panel-body{padding:16px;}
+  .twin-head .ghost-btn{margin-left:auto;}
+
+  .grid-2{display:grid;grid-template-columns:1.25fr 1fr;gap:20px;}
+  .grid-3{display:grid;grid-template-columns:1.4fr 1fr;gap:20px;margin-top:20px;}
+  @media (max-width:1000px){ .grid-2,.grid-3{grid-template-columns:1fr;} }
+
+  /* ---------- map ---------- */
+  #map{
+    height:380px;border-radius:4px;border:1px solid var(--line-strong);
+    filter:saturate(0.6) brightness(0.92);
+  }
+  .coord-readout{display:flex;gap:14px;margin-top:14px;flex-wrap:wrap;}
+  .coord-readout .field{flex:1;min-width:140px;}
+  label{display:block;font-size:11.5px;color:var(--text-dim);margin-bottom:5px;letter-spacing:.02em;}
+  input[type="text"],input[type="number"]{
+    width:100%;
+    background:var(--bg-2);
+    border:1px solid var(--line-strong);
+    color:var(--text);
+    font-family:var(--mono);font-size:13.5px;
+    padding:9px 10px;border-radius:4px;
+  }
+  .coord-readout input{color:var(--accent);}
+  input:focus{outline:1px solid var(--accent);border-color:var(--accent);}
+  .hint{font-size:12px;color:var(--text-dim);margin:10px 0 0;}
+  .field-row{margin-bottom:14px;}
+
+  /* ---------- dropzones ---------- */
+  .upload-block{margin-bottom:16px;}
+  .upload-title{
+    display:flex;align-items:center;justify-content:space-between;
+    font-size:12px;color:var(--text);font-weight:500;margin-bottom:7px;
+  }
+  .upload-title .tag{
+    font-family:var(--mono);font-size:10.5px;color:var(--text-dim);
+    border:1px solid var(--line-strong);border-radius:3px;padding:1px 6px;
+  }
+  .dropzone{
+    border:1px dashed var(--line-strong);border-radius:4px;
+    padding:18px 14px;text-align:center;cursor:pointer;
+    background:var(--bg-2);
+    transition:border-color .15s, background .15s;
+  }
+  .dropzone:hover,.dropzone.drag{border-color:var(--accent);background:var(--panel-3);}
+  .dropzone p{margin:0;color:var(--text-dim);font-size:12.5px;}
+  .dropzone strong{color:var(--text);font-weight:500;}
+  .dropzone input{display:none;}
+  .preview-row{
+    display:flex;align-items:center;gap:10px;margin-top:8px;
+    font-size:12.5px;color:var(--text-dim);
+    padding:8px 10px;border:1px solid var(--line);border-radius:4px;background:var(--bg-2);
+  }
+  .preview-row img{width:40px;height:40px;object-fit:cover;border:1px solid var(--line-strong);border-radius:3px;}
+  .preview-row .file-icon{
+    width:40px;height:40px;border-radius:3px;border:1px solid var(--line-strong);
+    display:flex;align-items:center;justify-content:center;
+    font-family:var(--mono);font-size:10px;color:var(--accent);background:var(--panel-3);
+  }
+  .preview-row .name{color:var(--text);font-family:var(--mono);font-size:12px;word-break:break-all;}
+  .preview-row .meta{font-size:11px;color:var(--text-faint);font-family:var(--mono);}
+  .preview-row button{
+    margin-left:auto;background:none;border:none;color:var(--bad);
+    font-family:inherit;font-size:12px;cursor:pointer;text-decoration:underline;
+  }
+
+  .checkbox-row{display:flex;align-items:flex-start;gap:9px;margin:4px 0 14px;}
+  .checkbox-row input{accent-color:var(--accent);width:15px;height:15px;margin-top:2px;}
+  .checkbox-row label{font-size:12.5px;color:var(--text-dim);margin:0;}
+
+  .btn{
+    width:100%;
+    font-family:var(--sans);font-weight:600;font-size:13.5px;
+    padding:12px 16px;border-radius:5px;cursor:pointer;margin-top:8px;
+    transition:background .15s,border-color .15s;
+  }
+  .btn.primary{background:var(--accent);color:#04231F;border:1px solid var(--accent);}
+  .btn.primary:hover:not(:disabled){background:#5EEAD4;}
+  .btn.primary:disabled{background:#1D4A45;border-color:#1D4A45;color:#7FB3AC;cursor:wait;}
+  .btn.secondary{background:transparent;color:var(--accent);border:1px solid var(--accent-dim);}
+  .btn.secondary:hover{border-color:var(--accent);}
+
+  .ghost-btn{
+    background:transparent;border:1px solid var(--line-strong);color:var(--text-dim);
+    font-family:inherit;font-size:11.5px;padding:6px 12px;border-radius:4px;cursor:pointer;
+  }
+  .ghost-btn:hover{border-color:var(--accent);color:var(--accent);}
+  .ghost-btn:disabled{opacity:.5;cursor:wait;}
+
+  .notice{
+    margin-top:14px;padding:11px 13px;border-radius:4px;font-size:13px;
+    border:1px solid;display:none;
+  }
+  .notice.show{display:block;}
+  .notice.error{border-color:var(--bad);color:#F7B4A9;background:rgba(242,109,91,0.08);}
+  .notice.success{border-color:var(--ok);color:#A7EBCB;background:rgba(52,211,153,0.08);}
+
+  /* ---------- telemetry / status ---------- */
+  .telemetry{
+    display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:20px;
+  }
+  @media (max-width:1000px){ .telemetry{grid-template-columns:repeat(2,1fr);} }
+  @media (max-width:520px){ .telemetry{grid-template-columns:1fr;} }
+  .metric{
+    background:var(--panel);border:1px solid var(--line-strong);border-radius:var(--radius);
+    padding:12px 14px;position:relative;
+  }
+  .metric .k{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--text-faint);}
+  .metric .v{font-family:var(--mono);font-size:14px;color:var(--text);margin-top:6px;word-break:break-word;}
+  .metric .v.unreported{color:var(--text-faint);}
+  .metric .v.ok{color:var(--ok);}
+  .metric .v.bad{color:var(--bad);}
+  .metric .v.warn{color:var(--warn);}
+  .metric .sub{font-size:11px;color:var(--text-faint);margin-top:3px;}
+  .metric::before{
+    content:"";position:absolute;left:0;top:10px;bottom:10px;width:2px;border-radius:2px;background:var(--line-strong);
+  }
+  .metric.ok::before{background:var(--ok);}
+  .metric.bad::before{background:var(--bad);}
+  .metric.warn::before{background:var(--warn);}
+
+  .evidence-list{list-style:none;margin:0;padding:0;}
+  .evidence-list li{
+    display:flex;justify-content:space-between;align-items:center;gap:10px;
+    padding:9px 0;border-bottom:1px solid var(--line);font-size:13px;
+  }
+  .evidence-list li:last-child{border-bottom:none;}
+  .evidence-list .name{color:var(--text-dim);}
+  .badge{
+    font-family:var(--mono);font-size:11.5px;padding:2px 8px;border-radius:3px;
+    border:1px solid var(--line-strong);color:var(--text-faint);text-align:right;
+  }
+  .badge.ok{color:var(--ok);border-color:rgba(52,211,153,0.4);background:rgba(52,211,153,0.07);}
+  .badge.bad{color:var(--bad);border-color:rgba(242,109,91,0.4);background:rgba(242,109,91,0.07);}
+  .badge.warn{color:var(--warn);border-color:rgba(245,184,75,0.4);background:rgba(245,184,75,0.07);}
+
+  /* ---------- pipeline ---------- */
+  .progress-track{height:6px;background:var(--bg-2);border-radius:999px;overflow:hidden;border:1px solid var(--line);}
+  .progress-fill{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent-2));transition:width .4s ease;}
+  .progress-label{display:flex;justify-content:space-between;font-family:var(--mono);font-size:11.5px;color:var(--text-dim);margin:0 0 8px;}
+  .steps{list-style:none;margin:16px 0 0;padding:0;}
+  .steps li{
+    display:flex;gap:12px;align-items:flex-start;padding:8px 0;position:relative;
+  }
+  .steps li:not(:last-child)::after{
+    content:"";position:absolute;left:8px;top:28px;bottom:-6px;width:1px;background:var(--line-strong);
+  }
+  .step-dot{
+    width:17px;height:17px;border-radius:50%;flex-shrink:0;margin-top:1px;
+    border:1.5px solid var(--text-faint);background:var(--bg-2);
+  }
+  .steps li.active .step-dot{border-color:var(--accent);box-shadow:0 0 0 4px rgba(45,212,191,0.15);animation:pulse 1.2s infinite;}
+  .steps li.done .step-dot{border-color:var(--ok);background:var(--ok);}
+  .steps li.error .step-dot{border-color:var(--bad);background:var(--bad);}
+  .steps li.skipped .step-dot{border-style:dashed;}
+  @keyframes pulse{50%{box-shadow:0 0 0 7px rgba(45,212,191,0.02);}}
+  .step-text .t{font-size:13px;color:var(--text);}
+  .step-text .d{font-size:11.5px;color:var(--text-faint);font-family:var(--mono);}
+  .steps li.done .t{color:var(--text);}
+  .steps li.pending .t{color:var(--text-dim);}
+
+  /* ---------- tables ---------- */
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  thead th{
+    text-align:left;font-weight:500;color:var(--text-faint);
+    padding:10px 16px;border-bottom:1px solid var(--line-strong);
+    font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;background:var(--panel-2);
+  }
+  tbody td{padding:10px 16px;border-bottom:1px solid var(--line);color:var(--text);font-family:var(--mono);font-size:12.5px;}
+  tbody td.ulpin{color:var(--accent);}
+  tbody tr:last-child td{border-bottom:none;}
+  .tier-tag{
+    display:inline-block;font-size:10.5px;padding:2px 7px;border-radius:3px;
+    border:1px solid var(--line-strong);color:var(--text-dim);
+  }
+  .empty-ledger{padding:24px 16px;color:var(--text-dim);font-size:13px;}
+  .ledger-footer{
+    display:flex;justify-content:space-between;align-items:center;
+    padding:12px 16px;border-top:1px solid var(--line);background:var(--panel-2);
+  }
+  .ledger-footer span{color:var(--text-dim);font-size:12px;font-family:var(--mono);}
+  .flush{padding:0 !important;}
+
+  /* ---------- lookup ---------- */
+  .lookup{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;}
+  .lookup .field-row{flex:1;min-width:220px;margin-bottom:0;}
+  .lookup button{
+    background:transparent;border:1px solid var(--accent-dim);color:var(--accent);
+    font-family:inherit;font-size:13px;padding:9px 18px;border-radius:4px;cursor:pointer;
+  }
+  .lookup button:hover{border-color:var(--accent);}
+  pre.record{
+    margin:14px 0 0;background:var(--bg-2);border:1px solid var(--line-strong);
+    padding:14px;font-size:12px;color:var(--text-dim);overflow-x:auto;border-radius:4px;
+    white-space:pre-wrap;word-break:break-word;font-family:var(--mono);
+  }
+
+  model-viewer{--poster-color:transparent;}
+  .stack{margin-top:20px;}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-mark">
+      <svg viewBox="0 0 24 24"><path d="M12 2 3 7v10l9 5 9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/></svg>
+    </div>
+    <div>
+      <h1>National 3D Cadastre</h1>
+      <small>Survey-grade digital twin console</small>
+    </div>
+  </div>
+  <div class="spacer"></div>
+  <span class="chip"><span class="status-dot" id="statusDot"></span><span id="statusText">checking API…</span></span>
+</header>
+
+<div class="wrap">
+
+  <div class="intro">
+    <h2>Register a 3D property from survey evidence</h2>
+    <p>Place the site, attach LiDAR / XYZ evidence and a blueprint or reference, and file it. The backend reconstructs and validates the 3D geometry, checks it against every registered parcel for volumetric clashes, and issues a ULPIN when the space is clear.</p>
+  </div>
+
+  <form id="cadastreForm">
+    <div class="grid-2">
+
+      <section class="panel">
+        <div class="panel-head"><span class="num">01</span><h2>Site location</h2></div>
+        <div class="panel-body">
+          <div id="map"></div>
+          <div class="coord-readout">
+            <div class="field">
+              <label for="lat">Latitude (WGS84)</label>
+              <input type="text" id="lat" name="site_lat" value="28.613900" inputmode="decimal" required>
+            </div>
+            <div class="field">
+              <label for="lon">Longitude (WGS84)</label>
+              <input type="text" id="lon" name="site_lon" value="77.209000" inputmode="decimal" required>
+            </div>
+          </div>
+          <p class="hint">Click the map to drop the site pin, drag the marker, or type coordinates from a GNSS/CORS rover reading.</p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><span class="num">02</span><h2>Survey evidence</h2></div>
+        <div class="panel-body">
+
+          <div class="upload-block">
+            <div class="upload-title"><span>LiDAR / XYZ point cloud</span><span class="tag">EVIDENCE</span></div>
+            <div class="dropzone" id="lidarDropzone">
+              <input type="file" id="lidarInput" accept=".xyz,.las,.laz,.ply,.pts,.txt,.csv">
+              <p><strong>Drop LiDAR or XYZ evidence</strong><br>or click to browse — .xyz .las .laz .ply .pts .txt .csv</p>
+            </div>
+            <div class="preview-row" id="lidarPreview" style="display:none;">
+              <div class="file-icon" id="lidarExt">XYZ</div>
+              <div>
+                <div class="name" id="lidarName"></div>
+                <div class="meta" id="lidarMeta"></div>
+              </div>
+              <button type="button" id="clearLidar">remove</button>
+            </div>
+          </div>
+
+          <div class="upload-block">
+            <div class="upload-title"><span>Blueprint / reference</span><span class="tag">REQUIRED</span></div>
+            <div class="dropzone" id="dropzone">
+              <input type="file" id="fileInput" accept="image/png,image/jpeg,image/tiff">
+              <p><strong>Drop the blueprint or reference image</strong><br>or click to browse — PNG, JPEG or TIFF</p>
+            </div>
+            <div class="preview-row" id="previewRow" style="display:none;">
+              <img id="previewImg" alt="">
+              <div>
+                <div class="name" id="previewName"></div>
+                <div class="meta" id="previewMeta"></div>
+              </div>
+              <button type="button" id="clearFile">remove</button>
+            </div>
+          </div>
+
+          <div class="field-row">
+            <label for="pixelScale">Blueprint pixel scale (m/pixel)</label>
+            <input type="text" id="pixelScale" name="pixel_scale_m" inputmode="decimal" autocomplete="off" placeholder="metres per pixel">
+            <p class="hint">Real-world metres covered by one blueprint pixel. Needed to georeference the blueprint at the site pin. Must be greater than 0.</p>
+          </div>
+
+          <div class="field-row">
+            <label for="buildingLabel">Building label (optional)</label>
+            <input type="text" id="buildingLabel" placeholder="e.g. Block A, Plot 14">
+          </div>
+
+          <div class="checkbox-row">
+            <input type="checkbox" id="isDemolition" name="is_demolition">
+            <label for="isDemolition">Authorize demolition of any existing property this volume overlaps</label>
+          </div>
+
+          <div class="field-row">
+            <label for="apiKeyInput">API key (only if this deployment requires one)</label>
+            <input type="text" id="apiKeyInput" placeholder="leave blank if not configured">
+          </div>
+
+          <button type="button" class="btn secondary" id="addBuildingBtn">+ Add this building to the batch</button>
+          <button type="submit" class="btn primary" id="submitBtn">File all queued building(s) for registration</button>
+          <div class="notice" id="notice"></div>
+        </div>
+      </section>
+
+    </div>
+  </form>
+
+  <!-- Telemetry strip -->
+  <div class="telemetry">
+    <div class="metric" id="mCrs"><div class="k">CRS status</div><div class="v unreported" id="stCrs">Awaiting backend report</div><div class="sub">Site input: WGS84 lat/lon</div></div>
+    <div class="metric" id="mLidar"><div class="k">LiDAR coverage</div><div class="v unreported" id="stLidar">No evidence attached</div><div class="sub" id="stLidarSub">Coverage is reported by the backend</div></div>
+    <div class="metric" id="mSurf"><div class="k">Measured surfaces</div><div class="v unreported" id="stSurfaces">—</div><div class="sub">Reported by the backend</div></div>
+    <div class="metric" id="mBrep"><div class="k">B-Rep validation</div><div class="v unreported" id="stBrep">Awaiting backend report</div><div class="sub">Solid integrity check</div></div>
+  </div>
+
+  <div class="grid-3">
+    <section class="panel">
+      <div class="panel-head twin-head">
+        <span class="num">03</span>
+        <h2>3D digital twin</h2>
+        <button type="button" class="ghost-btn" id="refreshTwinBtn">Reload live twin</button>
+      </div>
+      <div class="panel-body">
+        <div id="twinEmpty" class="empty-ledger">
+          The backend-generated 3D twin renders here once a parcel is registered — drag to orbit, scroll to zoom.
+        </div>
+        <model-viewer
+          id="twinViewer"
+          style="display:none; width:100%; height:480px; background:var(--bg-2); border:1px solid var(--line-strong); border-radius:4px;"
+          camera-controls
+          auto-rotate
+          auto-rotate-delay="1500"
+          rotation-per-second="18deg"
+          shadow-intensity="1"
+          exposure="1.05"
+          environment-image="neutral"
+          alt="3D cadastre digital twin">
+        </model-viewer>
+        <p class="hint" id="twinCaption" style="display:none;"></p>
+      </div>
+    </section>
+
+    <div>
+      <section class="panel">
+        <div class="panel-head"><span class="num">04</span><h2>Evidence status</h2></div>
+        <div class="panel-body">
+          <ul class="evidence-list">
+            <li><span class="name">Slab evidence</span><span class="badge" id="stSlab">not reported</span></li>
+            <li><span class="name">Roof evidence</span><span class="badge" id="stRoof">not reported</span></li>
+            <li><span class="name">Wall evidence</span><span class="badge" id="stWall">not reported</span></li>
+            <li><span class="name">3D clash / registration</span><span class="badge" id="stClash">not reported</span></li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="panel stack">
+        <div class="panel-head"><span class="num">05</span><h2>3D reconstruction</h2></div>
+        <div class="panel-body">
+          <div class="progress-label"><span id="progText">Idle</span><span id="progPct">0%</span></div>
+          <div class="progress-track"><div class="progress-fill" id="progFill"></div></div>
+          <ul class="steps" id="steps">
+            <li class="pending" data-step="stage"><span class="step-dot"></span><div class="step-text"><div class="t">Evidence staged</div><div class="d">blueprint attached</div></div></li>
+            <li class="pending" data-step="submit"><span class="step-dot"></span><div class="step-text"><div class="t">Submitted to backend</div><div class="d">batch request</div></div></li>
+            <li class="pending" data-step="recon"><span class="step-dot"></span><div class="step-text"><div class="t">3D reconstruction</div><div class="d">backend-authoritative geometry</div></div></li>
+            <li class="pending" data-step="brep"><span class="step-dot"></span><div class="step-text"><div class="t">B-Rep validation</div><div class="d">awaiting backend report</div></div></li>
+            <li class="pending" data-step="clash"><span class="step-dot"></span><div class="step-text"><div class="t">Clash check &amp; registration</div><div class="d">ULPIN issuance</div></div></li>
+            <li class="pending" data-step="twin"><span class="step-dot"></span><div class="step-text"><div class="t">GLB twin loaded</div><div class="d">viewer</div></div></li>
+          </ul>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <section class="panel stack" id="queuePanel" style="display:none;">
+    <div class="panel-head twin-head">
+      <span class="num">3B</span>
+      <h2>Buildings queued for this batch</h2>
+      <button type="button" class="ghost-btn" id="clearQueueBtn">Clear all</button>
+    </div>
+    <div class="panel-body flush">
+      <table>
+        <thead><tr><th>#</th><th>Label</th><th>Site</th><th>Blueprint</th><th>Scale (m/px)</th><th>LiDAR / XYZ</th><th></th></tr></thead>
+        <tbody id="queueBody"></tbody>
+      </table>
+    </div>
+    <p class="hint" style="padding:0 16px 14px;">
+      Every building in the batch is checked for a true 3D volumetric clash against
+      every other building here and everything already on the national ledger.
+      Overlapping buildings are rejected, or with demolition authorized, clear the
+      conflicting record exactly like a single registration would.
+    </p>
+  </section>
+
+  <section class="panel stack ledger">
+    <div class="panel-head"><span class="num">06</span><h2>Registration ledger</h2></div>
+    <div class="panel-body flush">
+      <table id="ledgerTable" style="display:none;">
+        <thead>
+          <tr><th>ULPIN</th><th>Unit</th><th>Tier</th><th>Level</th></tr>
+        </thead>
+        <tbody id="ledgerBody"></tbody>
+      </table>
+      <div class="empty-ledger" id="ledgerEmpty">No parcels registered yet in this session. File an application above to issue your first ULPIN.</div>
+    </div>
+    <div class="ledger-footer" id="ledgerFooter" style="display:none;">
+      <span id="modelStatus"></span>
+      <a href="#" id="downloadLink" target="_blank">Download 3D model (.glb) →</a>
+    </div>
+  </section>
+
+  <section class="panel stack">
+    <div class="panel-head"><span class="num">07</span><h2>ULPIN lookup</h2></div>
+    <div class="panel-body">
+      <div class="lookup">
+        <div class="field-row">
+          <label for="ulpinLookup">ULPIN</label>
+          <input type="number" id="ulpinLookup" placeholder="e.g. 10056066303002">
+        </div>
+        <button type="button" id="lookupBtn">Search</button>
+      </div>
+      <pre class="record" id="lookupResult" style="display:none;"></pre>
+    </div>
+  </section>
+
+</div>
+
+<script type="module" src="https://unpkg.com/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+  const API_BASE = window.location.origin;
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  function fmtSize(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1073741824) return `${(bytes / 1048576).toFixed(1)} MB`;
+    return `${(bytes / 1073741824).toFixed(2)} GB`;
+  }
+
+  // --- Health check -------------------------------------------------
+  fetch(`${API_BASE}/`).then(r => {
+    const dot = document.getElementById('statusDot');
+    const text = document.getElementById('statusText');
+    if (r.ok) { dot.classList.add('online'); text.textContent = 'API online'; }
+    else { dot.classList.add('offline'); text.textContent = 'API unreachable'; }
+  }).catch(() => {
+    document.getElementById('statusDot').classList.add('offline');
+    document.getElementById('statusText').textContent = 'API unreachable';
+  });
+
+  // --- Map ------------------------------------------------------------
+  const latInput = document.getElementById('lat');
+  const lonInput = document.getElementById('lon');
+
+  const map = L.map('map', { zoomControl: true }).setView([28.6139, 77.2090], 12);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; OpenStreetMap &copy; CARTO',
+    maxZoom: 19
+  }).addTo(map);
+
+  let marker = L.marker([28.6139, 77.2090], { draggable: true }).addTo(map);
+
+  function setLatLon(lat, lon) {
+    latInput.value = lat.toFixed(6);
+    lonInput.value = lon.toFixed(6);
+  }
+
+  map.on('click', (e) => {
+    marker.setLatLng(e.latlng);
+    setLatLon(e.latlng.lat, e.latlng.lng);
+  });
+  marker.on('dragend', () => {
+    const p = marker.getLatLng();
+    setLatLon(p.lat, p.lng);
+  });
+  [latInput, lonInput].forEach(el => {
+    el.addEventListener('change', () => {
+      const lat = parseFloat(latInput.value), lon = parseFloat(lonInput.value);
+      if (!isNaN(lat) && !isNaN(lon)) {
+        marker.setLatLng([lat, lon]);
+        map.panTo([lat, lon]);
+      }
+    });
+  });
+
+  // --- Status / pipeline helpers ---------------------------------------
+  // Everything shown here is either (a) the state of the client's own
+  // request lifecycle, (b) a value the backend returned, or (c) an explicit
+  // "not reported" placeholder. No values are invented client-side.
+  const STEP_ORDER = ['stage', 'submit', 'recon', 'brep', 'clash', 'twin'];
+  const stepState = {};
+  STEP_ORDER.forEach(s => stepState[s] = 'pending');
+
+  function setStep(name, state, detail) {
+    stepState[name] = state;
+    const li = document.querySelector(`#steps [data-step="${name}"]`);
+    if (!li) return;
+    li.className = state;
+    if (detail) li.querySelector('.d').textContent = detail;
+    renderProgress();
+  }
+  function renderProgress() {
+    const done = STEP_ORDER.filter(s => stepState[s] === 'done').length;
+    const pct = Math.round((done / STEP_ORDER.length) * 100);
+    document.getElementById('progFill').style.width = pct + '%';
+    document.getElementById('progPct').textContent = pct + '%';
+    const active = STEP_ORDER.find(s => stepState[s] === 'active');
+    const errored = STEP_ORDER.find(s => stepState[s] === 'error');
+    const label = document.querySelector(`#steps [data-step="${active || errored || ''}"] .t`);
+    document.getElementById('progText').textContent =
+      errored ? `Stopped — ${label ? label.textContent : 'error'}` :
+      active ? (label ? label.textContent : 'Working…') :
+      done === STEP_ORDER.length ? 'Complete' :
+      done > 0 ? 'Partially complete' : 'Idle';
+  }
+  function resetPipelineFrom(startIdx) {
+    STEP_ORDER.slice(startIdx).forEach(s => setStep(s, 'pending'));
+  }
+
+  function setMetric(valueId, wrapperId, text, kind) {
+    const v = document.getElementById(valueId);
+    v.textContent = text;
+    v.className = 'v ' + (kind || '');
+    if (wrapperId) {
+      const w = document.getElementById(wrapperId);
+      w.className = 'metric ' + (kind && kind !== 'unreported' ? kind : '');
+    }
+  }
+  function setBadge(id, text, kind) {
+    const b = document.getElementById(id);
+    b.textContent = text;
+    b.className = 'badge ' + (kind || '');
+  }
+
+  // Look for a backend-reported field on the response root, then on each
+  // building entry. Returns undefined if the backend did not report it.
+  function reportField(data, keys) {
+    const sources = [data].concat(Array.isArray(data && data.buildings) ? data.buildings : []);
+    for (const src of sources) {
+      if (!src || typeof src !== 'object') continue;
+      for (const k of keys) {
+        if (src[k] !== undefined && src[k] !== null) return src[k];
+      }
+    }
+    return undefined;
+  }
+  function fmtReported(v) {
+    if (typeof v === 'boolean') return v ? 'yes' : 'no';
+    if (typeof v === 'object') return JSON.stringify(v);
+    return String(v);
+  }
+  function classifyReported(v) {
+    const s = fmtReported(v).toLowerCase();
+    if (/(fail|invalid|error|reject|clash|missing|insufficient|no\b|false)/.test(s)) return 'bad';
+    if (/(partial|warn|low|pending)/.test(s)) return 'warn';
+    return 'ok';
+  }
+
+  function applyBackendReport(data) {
+    const map1 = [
+      ['stCrs', 'mCrs', ['crs_status', 'crs']],
+      ['stLidar', 'mLidar', ['lidar_coverage', 'lidar_coverage_status']],
+      ['stSurfaces', 'mSurf', ['measured_surface_count', 'surface_count']],
+      ['stBrep', 'mBrep', ['brep_validation', 'brep_status', 'brep_valid']],
+    ];
+    map1.forEach(([vid, wid, keys]) => {
+      const v = reportField(data, keys);
+      if (v === undefined) {
+        setMetric(vid, wid, vid === 'stSurfaces' ? 'Not reported' : 'Not reported by backend', 'unreported');
+      } else {
+        setMetric(vid, wid, fmtReported(v), vid === 'stSurfaces' ? 'ok' : classifyReported(v));
+      }
+    });
+
+    [['stSlab', ['slab_evidence', 'slab_evidence_status']],
+     ['stRoof', ['roof_evidence', 'roof_evidence_status']],
+     ['stWall', ['wall_evidence', 'wall_evidence_status']]].forEach(([id, keys]) => {
+      const v = reportField(data, keys);
+      if (v === undefined) setBadge(id, 'not reported', '');
+      else setBadge(id, fmtReported(v), classifyReported(v));
+    });
+
+    // B-Rep step reflects the backend report only.
+    const brep = reportField(data, ['brep_validation', 'brep_status', 'brep_valid']);
+    if (brep === undefined) setStep('brep', 'skipped', 'not reported by backend');
+    else setStep('brep', classifyReported(brep) === 'bad' ? 'error' : 'done', fmtReported(brep));
+  }
+
+  function applyClashResult(data) {
+    const explicit = reportField(data, ['clash_status', 'registration_status']);
+    const total = typeof data.total_registered_count === 'number' ? data.total_registered_count : null;
+    if (explicit !== undefined) {
+      const kind = classifyReported(explicit);
+      setBadge('stClash', fmtReported(explicit), kind);
+      setStep('clash', kind === 'bad' ? 'error' : 'done', fmtReported(explicit));
+    } else if (total !== null) {
+      if (total > 0) {
+        setBadge('stClash', `clear — ${total} registered`, 'ok');
+        setStep('clash', 'done', `${total} unit(s) registered`);
+      } else {
+        setBadge('stClash', 'no units registered', 'bad');
+        setStep('clash', 'error', 'no units registered — check for clashes');
+      }
+    } else {
+      setBadge('stClash', 'not reported', '');
+      setStep('clash', 'skipped', 'not reported by backend');
+    }
+  }
+
+  // --- File upload: LiDAR / XYZ ----------------------------------------
+  const lidarDropzone = document.getElementById('lidarDropzone');
+  const lidarInput = document.getElementById('lidarInput');
+  const lidarPreview = document.getElementById('lidarPreview');
+  // The LiDAR File is tracked here rather than read back from the <input>,
+  // because a dropped File cannot be reliably assigned into input.files.
+  let selectedLidarFile = null;
+
+  function refreshEvidenceMetrics() {
+    if (selectedLidarFile) {
+      const f = selectedLidarFile;
+      setMetric('stLidar', 'mLidar', 'Evidence attached', 'warn');
+      document.getElementById('stLidarSub').textContent = `${f.name} — coverage pending backend`;
+    } else {
+      setMetric('stLidar', 'mLidar', 'No evidence attached', 'unreported');
+      document.getElementById('stLidarSub').textContent = 'Coverage is reported by the backend';
+    }
+  }
+  function showLidar(file) {
+    const ext = (file.name.split('.').pop() || 'file').toUpperCase().slice(0, 4);
+    document.getElementById('lidarExt').textContent = ext;
+    document.getElementById('lidarName').textContent = file.name;
+    document.getElementById('lidarMeta').textContent = fmtSize(file.size);
+    lidarPreview.style.display = 'flex';
+    lidarDropzone.style.display = 'none';
+    refreshEvidenceMetrics();
+  }
+  function clearLidar() {
+    selectedLidarFile = null;
+    lidarInput.value = '';
+    lidarPreview.style.display = 'none';
+    lidarDropzone.style.display = 'block';
+    refreshEvidenceMetrics();
+  }
+  lidarDropzone.addEventListener('click', () => lidarInput.click());
+  ['dragover', 'dragenter'].forEach(evt =>
+    lidarDropzone.addEventListener(evt, (e) => { e.preventDefault(); lidarDropzone.classList.add('drag'); })
+  );
+  ['dragleave', 'drop'].forEach(evt =>
+    lidarDropzone.addEventListener(evt, (e) => { e.preventDefault(); lidarDropzone.classList.remove('drag'); })
+  );
+  lidarDropzone.addEventListener('drop', (e) => {
+    const dropped = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (dropped) {
+      selectedLidarFile = dropped;
+      showLidar(dropped);
+    }
+  });
+  lidarInput.addEventListener('change', () => {
+    if (lidarInput.files.length) {
+      selectedLidarFile = lidarInput.files[0];
+      showLidar(selectedLidarFile);
+    }
+  });
+  document.getElementById('clearLidar').addEventListener('click', clearLidar);
+
+  // --- File upload: blueprint / reference ------------------------------
+  const dropzone = document.getElementById('dropzone');
+  const fileInput = document.getElementById('fileInput');
+  const previewRow = document.getElementById('previewRow');
+  const previewImg = document.getElementById('previewImg');
+  const previewName = document.getElementById('previewName');
+  const previewMeta = document.getElementById('previewMeta');
+  // The blueprint File is tracked here rather than read back from the <input>,
+  // because a dropped File cannot be reliably assigned into input.files.
+  let selectedBlueprintFile = null;
+
+  dropzone.addEventListener('click', () => fileInput.click());
+  ['dragover', 'dragenter'].forEach(evt =>
+    dropzone.addEventListener(evt, (e) => { e.preventDefault(); dropzone.classList.add('drag'); })
+  );
+  ['dragleave', 'drop'].forEach(evt =>
+    dropzone.addEventListener(evt, (e) => { e.preventDefault(); dropzone.classList.remove('drag'); })
+  );
+  dropzone.addEventListener('drop', (e) => {
+    const dropped = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (dropped) {
+      selectedBlueprintFile = dropped;
+      showPreview(dropped);
+    }
+  });
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files.length) {
+      selectedBlueprintFile = fileInput.files[0];
+      showPreview(selectedBlueprintFile);
+    }
+  });
+
+  function showPreview(file) {
+    previewImg.src = URL.createObjectURL(file);
+    previewName.textContent = file.name;
+    previewMeta.textContent = fmtSize(file.size);
+    previewRow.style.display = 'flex';
+    dropzone.style.display = 'none';
+    setStep('stage', 'done', `blueprint: ${file.name}`);
+  }
+  document.getElementById('clearFile').addEventListener('click', () => {
+    selectedBlueprintFile = null;
+    fileInput.value = '';
+    previewRow.style.display = 'none';
+    dropzone.style.display = 'block';
+    setStep('stage', 'pending', 'blueprint attached');
+  });
+
+  // --- Submit -----------------------------------------------------------
+  const form = document.getElementById('cadastreForm');
+  const submitBtn = document.getElementById('submitBtn');
+  const notice = document.getElementById('notice');
+  const ledgerTable = document.getElementById('ledgerTable');
+  const ledgerBody = document.getElementById('ledgerBody');
+  const ledgerEmpty = document.getElementById('ledgerEmpty');
+  const ledgerFooter = document.getElementById('ledgerFooter');
+  const twinViewer = document.getElementById('twinViewer');
+  const twinEmpty = document.getElementById('twinEmpty');
+  const twinCaption = document.getElementById('twinCaption');
+  const refreshTwinBtn = document.getElementById('refreshTwinBtn');
+
+  function loadTwin(registeredCount) {
+    // Cache-bust: the .glb is regenerated in place under the same
+    // filename every time the pipeline runs, so without a query-string
+    // bump the browser (and model-viewer's internal cache) would keep
+    // showing the previous version after a new registration.
+    const url = `${API_BASE}/api/v1/download-model?t=${Date.now()}`;
+    twinViewer.setAttribute('src', url);
+    twinViewer.style.display = 'block';
+    twinEmpty.style.display = 'none';
+    twinCaption.style.display = 'block';
+    twinCaption.textContent = typeof registeredCount === 'number'
+      ? `Live twin — backend-generated geometry for every parcel on the national ledger, including the ${registeredCount} unit(s) just filed.`
+      : 'Live twin — backend-generated geometry for every parcel currently on the national ledger.';
+  }
+
+  twinViewer.addEventListener('load', () => {
+    setStep('twin', 'done', 'GLB rendered in viewer');
+  });
+  twinViewer.addEventListener('error', () => {
+    twinViewer.style.display = 'none';
+    twinEmpty.style.display = 'block';
+    twinCaption.style.display = 'none';
+    twinEmpty.textContent = 'No digital twin available yet — register a parcel above, or the model may still be exporting.';
+    setStep('twin', 'error', 'model unavailable');
+  });
+
+  refreshTwinBtn.addEventListener('click', () => {
+    refreshTwinBtn.disabled = true;
+    refreshTwinBtn.textContent = 'Loading…';
+    setStep('twin', 'active', 'loading GLB');
+    loadTwin();
+    setTimeout(() => {
+      refreshTwinBtn.disabled = false;
+      refreshTwinBtn.textContent = 'Reload live twin';
+    }, 800);
+  });
+
+  // On first page load, silently try to show whatever twin already
+  // exists on the server (e.g. from a previous session) rather than
+  // making the user register something new just to see it.
+  fetch(`${API_BASE}/api/v1/download-model`, { method: 'HEAD' })
+    .then(r => { if (r.ok) loadTwin(); })
+    .catch(() => {});
+
+  function showNotice(kind, msg) {
+    notice.className = `notice show ${kind}`;
+    notice.textContent = msg;
+  }
+
+  function addLedgerRows(units) {
+    if (!units || !units.length) return;
+    ledgerEmpty.style.display = 'none';
+    ledgerTable.style.display = 'table';
+    units.forEach(u => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td class="ulpin">${esc(u.ulpin)}</td>
+        <td>${esc(u.unit_id)}</td>
+        <td><span class="tier-tag">${esc(u.tier)}</span></td>
+        <td>${esc(u.floor_level)}</td>`;
+      ledgerBody.prepend(tr);
+    });
+  }
+
+  // --- Multi-building batch queue ---------------------------------------
+  // Each entry is one building's own blueprint/reference image (plus
+  // optional LiDAR/XYZ evidence) anchored at its own site_lat/site_lon.
+  // Every building queued here -- and every building already on the
+  // national ledger -- is checked against every other one via the same true
+  // 3D volumetric clash check on the backend. All 3D geometry is produced
+  // by the backend; this page only collects evidence and displays results.
+  let buildingQueue = [];
+  const queuePanel = document.getElementById('queuePanel');
+  const queueBody = document.getElementById('queueBody');
+  const buildingLabelInput = document.getElementById('buildingLabel');
+  const pixelScaleInput = document.getElementById('pixelScale');
+  const apiKeyInput = document.getElementById('apiKeyInput');
+
+  function renderQueue() {
+    queuePanel.style.display = buildingQueue.length ? 'block' : 'none';
+    queueBody.innerHTML = '';
+    buildingQueue.forEach((b, i) => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${i + 1}</td>
+        <td>${esc(b.label)}</td>
+        <td>${b.lat.toFixed(4)}, ${b.lon.toFixed(4)}</td>
+        <td>${esc(b.file.name)}</td>
+        <td>${b.pixelScaleM !== null ? esc(b.pixelScaleM) : '—'}</td>
+        <td>${b.lidarFile ? esc(b.lidarFile.name) : '—'}</td>
+        <td><button type="button" class="ghost-btn" data-remove="${i}">remove</button></td>`;
+      queueBody.appendChild(tr);
+    });
+    queueBody.querySelectorAll('[data-remove]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        buildingQueue.splice(parseInt(btn.dataset.remove, 10), 1);
+        renderQueue();
+      });
+    });
+    if (buildingQueue.length) setStep('stage', 'done', `${buildingQueue.length} building(s) queued`);
+  }
+
+  // GCP georeferencing (gcp_pixels + gcp_real_world) is the alternative to
+  // GPS + pixel scale. The page has no GCP input yet; whatever collects GCPs
+  // sets currentGcps = { pixels: [[x,y],...], realWorld: [[x,y],...] }.
+  let currentGcps = null;
+  function hasValidGcps(g) {
+    if (!g || !Array.isArray(g.pixels) || !Array.isArray(g.realWorld)) return false;
+    if (!g.pixels.length || g.pixels.length !== g.realWorld.length) return false;
+    return [...g.pixels, ...g.realWorld].every(pt =>
+      Array.isArray(pt) && pt.length === 2 && pt.every(Number.isFinite));
+  }
+
+  // Parses the blueprint pixel scale (metres per pixel).
+  //   empty field          -> null (omitted)
+  //   finite number > 0    -> that number
+  //   anything else        -> NaN (invalid)
+  function readPixelScale() {
+    const raw = pixelScaleInput.value.trim();
+    if (raw === '') return null;
+    const n = Number(raw);
+    return (Number.isFinite(n) && n > 0) ? n : NaN;
+  }
+
+  // Returns a human-readable problem with the current form, or null if it
+  // is ready to be queued.
+  function currentFormProblem() {
+    if (!selectedBlueprintFile) return 'Attach a blueprint / reference image.';
+    const lat = parseFloat(latInput.value), lon = parseFloat(lonInput.value);
+    if (isNaN(lat) || isNaN(lon)) return 'Latitude and longitude must be valid numbers.';
+    const scale = readPixelScale();
+    if (Number.isNaN(scale) || scale === null) {
+      return 'Enter the blueprint pixel scale (m/pixel) as a number greater than 0.';
+    }
+    return null;
+  }
+
+  // Reads the current form values into a queue entry.
+  // Returns null if the required fields aren't filled.
+  function captureCurrentBuildingFromForm() {
+    if (currentFormProblem()) return null;
+    const lat = parseFloat(latInput.value), lon = parseFloat(lonInput.value);
+    return {
+      label: buildingLabelInput.value.trim() || `Building ${buildingQueue.length + 1}`,
+      lat, lon,
+      pixelScaleM: readPixelScale(),
+      gcps: hasValidGcps(currentGcps) ? currentGcps : null,
+      isDemolition: document.getElementById('isDemolition').checked,
+      file: selectedBlueprintFile,
+      lidarFile: selectedLidarFile,
+    };
+  }
+
+  function resetBuildingFileFields() {
+    currentGcps = null;
+    selectedBlueprintFile = null;
+    fileInput.value = '';
+    previewRow.style.display = 'none';
+    dropzone.style.display = 'block';
+    buildingLabelInput.value = '';
+    pixelScaleInput.value = '';
+    clearLidar();
+  }
+
+  document.getElementById('addBuildingBtn').addEventListener('click', () => {
+    const problem = currentFormProblem();
+    if (problem) {
+      showNotice('error', problem);
+      return;
+    }
+    const entry = captureCurrentBuildingFromForm();
+    buildingQueue.push(entry);
+    renderQueue();
+    resetBuildingFileFields();
+    notice.className = 'notice';
+  });
+
+  document.getElementById('clearQueueBtn').addEventListener('click', () => {
+    buildingQueue = [];
+    renderQueue();
+  });
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+
+    // If the user filled in a building but forgot to click "Add", queue
+    // it automatically rather than silently dropping it.
+    if (selectedBlueprintFile) {
+      const problem = currentFormProblem();
+      if (problem) {
+        showNotice('error', problem);
+        return;
+      }
+    }
+    const pending = captureCurrentBuildingFromForm();
+    if (pending) {
+      buildingQueue.push(pending);
+      renderQueue();
+      resetBuildingFileFields();
+    }
+
+    if (!buildingQueue.length) {
+      showNotice('error', 'Attach at least one blueprint / reference (with its site location and pixel scale) before filing.');
+      return;
+    }
+
+    const fd = new FormData();
+    const metadata = buildingQueue.map(b => {
+      const m = {
+        site_lat: b.lat,
+        site_lon: b.lon,
+        ...(b.pixelScaleM !== null ? { pixel_scale_m: b.pixelScaleM } : {}),
+        ...(b.gcps ? { gcp_pixels: b.gcps.pixels, gcp_real_world: b.gcps.realWorld } : {}),
+        is_demolition: b.isDemolition,
+        label: b.label,
+      };
+      if (b.lidarFile) m.lidar_file_name = b.lidarFile.name;
+      return m;
+    });
+    fd.append('buildings', JSON.stringify(metadata));
+    buildingQueue.forEach(b => fd.append('files', b.file));
+    buildingQueue.forEach(b => { if (b.lidarFile) fd.append('lidar_files', b.lidarFile); });
+
+    const headers = {};
+    if (apiKeyInput.value.trim()) headers['X-API-Key'] = apiKeyInput.value.trim();
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = buildingQueue.length > 1
+      ? `Processing ${buildingQueue.length} buildings…`
+      : 'Processing survey…';
+    notice.className = 'notice';
+
+    resetPipelineFrom(1);
+    setStep('stage', 'done', `${buildingQueue.length} building(s) staged`);
+    setStep('submit', 'active', 'uploading evidence');
+
+    try {
+      const fetchPromise = fetch(`${API_BASE}/api/v1/process-cadastre-batch`, { method: 'POST', body: fd, headers });
+      setStep('submit', 'done', 'request sent');
+      setStep('recon', 'active', 'backend processing');
+      const res = await fetchPromise;
+      const data = await res.json();
+
+      if (!res.ok || data.status === 'error') {
+        setStep('recon', 'error', 'backend reported an error');
+        showNotice('error', data.message || data.detail || 'Registration failed. Check the server log for details.');
+        return;
+      }
+
+      // 0 B-Reps reconstructed: reconstruction is BLOCKED and every later stage
+      // never ran -- nothing downstream may be shown as done.
+      const blocked = data.total_brep_count === 0;
+      if (blocked) {
+        setStep('recon', 'error', 'BLOCKED — 0 B-Reps reconstructed');
+        applyBackendReport(data);
+        setMetric('stBrep', 'mBrep', 'NOT RUN', 'unreported');
+        setStep('brep', 'skipped', 'NOT RUN — no B-Rep reconstructed');
+        setBadge('stClash', 'NOT RUN', '');
+        setStep('clash', 'skipped', 'NOT RUN — clash check & registration');
+      } else {
+        setStep('recon', 'done', 'backend returned result');
+        applyBackendReport(data);
+        applyClashResult(data);
+      }
+
+      const perBuilding = (data.buildings || []).map(b => {
+        const ok = (b.registered_count || 0) > 0;
+        return `${b.label}: ${ok ? `${b.registered_count} registered` : (b.error ? `failed (${b.error})` : (b.brep_count === 0 ? 'reconstruction BLOCKED — 0 B-Reps; validation, clash and registration not run' : 'no units registered — check for clashes'))}`;
+      }).join(' · ');
+
+      showNotice(
+        data.total_registered_count > 0 ? 'success' : 'error',
+        `${data.total_registered_count} total unit(s) registered across ${data.buildings.length} building(s). ${perBuilding}`
+      );
+
+      (data.buildings || []).forEach(b => addLedgerRows(b.registered_units));
+
+      if (!blocked && data.model_download_url) {
+        ledgerFooter.style.display = 'flex';
+        document.getElementById('downloadLink').href = data.model_download_url;
+        document.getElementById('modelStatus').textContent = '3D model generated';
+        setStep('twin', 'active', 'loading GLB');
+        loadTwin(data.total_registered_count);
+      } else {
+        setStep('twin', 'skipped', blocked ? 'not loaded — no new model (0 B-Reps)' : 'no model URL returned');
+      }
+
+      buildingQueue = [];
+      renderQueue();
+    } catch (err) {
+      setStep('recon', 'error', 'API unreachable');
+      showNotice('error', `Could not reach the API: ${err.message}`);
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'File all queued building(s) for registration';
+    }
+  });
+
+  // --- ULPIN lookup -------------------------------------------------------
+  document.getElementById('lookupBtn').addEventListener('click', async () => {
+    const ulpin = document.getElementById('ulpinLookup').value.trim();
+    const out = document.getElementById('lookupResult');
+    if (!ulpin) return;
+    out.style.display = 'block';
+    out.textContent = 'Searching…';
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/property/${encodeURIComponent(ulpin)}`);
+      const data = await res.json();
+      out.textContent = JSON.stringify(data, null, 2);
+    } catch (err) {
+      out.textContent = `Lookup failed: ${err.message}`;
+    }
+  });
+</script>
+</body>
+</html>

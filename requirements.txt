@@ -1,0 +1,30 @@
+# Core API
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9   # required by FastAPI for File()/Form() uploads
+pydantic>=2.6
+python-dotenv>=1.0        # loads .env into os.environ (see config.py)
+
+# Database
+psycopg2-binary>=2.9      # swap for psycopg2 (built from source) in production
+
+# Geospatial / geometry
+shapely>=2.0
+pyproj>=3.6
+trimesh>=4.0
+numpy>=1.26
+
+# LiDAR / CV / ML
+laspy>=2.5
+opencv-python-headless>=4.9
+scikit-learn>=1.4
+
+# NOTE: pythonocc-core (the `OCC.Core.*` imports in main.py, cad_engine.py,
+# gis_parcel_loader.py, ogc_to_3d.py, subsurface_engine.py) is NOT pip-
+# installable on most platforms -- install it via conda/mamba instead:
+#   conda install -c conda-forge pythonocc-core=7.7
+# Do this in whatever base image/environment you deploy from; it can't
+# live in this requirements.txt.
+
+# Testing
+requests>=2.31
